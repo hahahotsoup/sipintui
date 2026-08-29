@@ -101,9 +101,7 @@ static bool SimonIsReadOnly(string cmd, string sub)
           or "--help" or "-h" or "--version" or "--insights" or "--insights-interval" or "simon"
        || (cmd == "telemetry" && sub is "status" or "show")
        || (cmd == "--dedup" && sub is "list" or "scan")
-       || (cmd == "--policy" && sub == "list")
-       // Phase1 ingest:只读子命令(list/show/retrieve/groups/ask)在挡位 2 放行;其余写子命令默认拦截
-       || (cmd == "ingest" && sub is "list" or "show" or "retrieve" or "groups" or "ask");
+       || (cmd == "--policy" && sub == "list");
 
 // 统一拦截入口:返回被拦截的原因;null=放行。
 // 用户语义:挡位 2 = CLI 写操作一律拒绝;挡位 3 = CLI 所有调用一律拒绝。
@@ -458,55 +456,5 @@ static void SimonEncryptSensitiveFiles()
     }
     catch { /* 迁移失败不阻断;后续写入仍走加密 */ }
 }
-
-// ══════════ 数据库迁移:Phase2 树状评论+多标签 ══════════
-// 迁移代码集中管理,便于追踪版本
-static void MigratePhase2(string dbPath)
-{
-    try
-    {
-        using var conn = OpenDb(dbPath);
-        conn.Open();
-        var cmd = conn.CreateCommand();
-
-        // 给 Evidence 补新字段
-        try { cmd.CommandText = "ALTER TABLE Evidence ADD COLUMN FragmentId TEXT"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 列已存在则忽略 */ }
-        try { cmd.CommandText = "ALTER TABLE Evidence ADD COLUMN Platform TEXT"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 列已存在则忽略 */ }
-        try { cmd.CommandText = "ALTER TABLE Evidence ADD COLUMN ContentId TEXT"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 列已存在则忽略 */ }
-        try { cmd.CommandText = "ALTER TABLE Evidence ADD COLUMN Author TEXT"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 列已存在则忽略 */ }
-        try { cmd.CommandText = "ALTER TABLE Evidence ADD COLUMN CanonicalUrl TEXT"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 列已存在则忽略 */ }
-        try { cmd.CommandText = "ALTER TABLE Evidence ADD COLUMN Context TEXT"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 列已存在则忽略 */ }
-        try { cmd.CommandText = "ALTER TABLE Evidence ADD COLUMN Snapshot TEXT"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 列已存在则忽略 */ }
-        try { cmd.CommandText = "ALTER TABLE Evidence ADD COLUMN Note TEXT"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 列已存在则忽略 */ }
-        try { cmd.CommandText = "ALTER TABLE Evidence ADD COLUMN WatchEnabled INTEGER DEFAULT 0"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 列已存在则忽略 */ }
-        try { cmd.CommandText = "ALTER TABLE Evidence ADD COLUMN WatchInterval INTEGER DEFAULT 5"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 列已存在则忽略 */ }
-        try { cmd.CommandText = "ALTER TABLE Evidence ADD COLUMN WatchLastCheckedAt TEXT"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 列已存在则忽略 */ }
-        try { cmd.CommandText = "ALTER TABLE Evidence ADD COLUMN WatchLastHash TEXT"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 列已存在则忽略 */ }
-        try { cmd.CommandText = "ALTER TABLE Evidence ADD COLUMN ViewCount INTEGER DEFAULT 0"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 列已存在则忽略 */ }
-        try { cmd.CommandText = "ALTER TABLE Evidence ADD COLUMN LastViewedAt TEXT"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 列已存在则忽略 */ }
-
-        // 创建索引
-        try { cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_evidence_fragment ON Evidence (FragmentId)"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 索引已存在则忽略 */ }
-        try { cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_evidence_platform ON Evidence (Platform)"; cmd.ExecuteNonQuery(); }
-        catch (SqliteException) { /* 索引已存在则忽略 */ }
-    }
-    catch { /* 迁移失败不阻断 */ }
-}
-
 
 }
