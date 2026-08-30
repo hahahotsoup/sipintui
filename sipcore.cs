@@ -30,7 +30,6 @@ using Terminal.Gui.Views;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Input;
 using Terminal.Gui.Text;
-using PdfiumViewer;
 
 // 统一 UTF-8 输入/输出：避免中文在终端 / AI 调用（PowerShell 默认 GBK 代码页）时乱码，
 // 也保证管道输入的同意短语等中文内容按 UTF-8 解码
@@ -593,6 +592,8 @@ static int BackfillFulltextSidecars(string dbPath, List<(int Id, int FeedId)> it
         if (list.Any(e => e.ItemId == id && e.ModelId == modelId) || toAdd.Any(e => e.ItemId == id)) continue;
         string? ft = ReadFulltextCache(id);
         if (ft == null) continue;
+        // 超长正文改走切块向量（VectorsChunks），跳过整篇 sidecar 以免重复嵌入
+        if (EstimateTokens(StripHtml(ft)) > cfg.Chunking.SizeTokens) continue;
         var vec = SafeEmbed(ft, cfg, json: false, articleId: id, sourceId: feedId).GetAwaiter().GetResult();
         if (vec == null) continue;
         toAdd.Add((id, feedId, modelId, vec));
@@ -652,39 +653,194 @@ static string ReadTextFile(string path)
     return File.ReadAllText(path);
 }
 
-// PDF 导入:用 pdfium(PdfiumViewer)把每一页渲染成 PNG 图片,不再抽文本。
-    // 原因:PDF 里常含表格/复杂排版,文本抽取会丢版式;直接出页面图片最保真。
-    // 每页固定宽度 1200px(~终端 120 列),高度按比例,存 assetDir,<img> 交 HtmlToMarkdown。
+// 按文件头魔法字节嗅探图片扩展名;返回 null 表示无法识别。
+static string? ImageExtFromMagic(byte[] b)
+{
+    if (b == null || b.Length < 4) return null;
+    if (b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return ".jpg";           // JPEG
+    if (b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) return ".png"; // PNG
+    if (b[0] == 0x47 && b[1] == 0x49 && b[2] == 0x46) return ".gif";           // GIF
+    if (b[0] == 0x42 && b[1] == 0x4D) return ".bmp";                           // BMP
+    if ((b[0] == 0x49 && b[1] == 0x49 && b[2] == 0x2A && b[3] == 0x00) ||
+        (b[0] == 0x4D && b[1] == 0x4D && b[2] == 0x00 && b[3] == 0x2A)) return ".tiff"; // TIFF
+    return null;
+}
+
+// PDF 导入:终端内暂不支持显示 PDF 内容,已保存到 imported/ 目录,请等待 web 端适配。
     static string ReadPdfFile(string path, string assetDir)
     {
-        var sb = new System.Text.StringBuilder();
         try
         {
-            using var doc = PdfiumViewer.PdfDocument.Load(path);
-            int pageCount = doc.PageCount;
-            const int targetWidth = 1200;   // 约终端 120 列
-            for (int i = 0; i < pageCount; i++)
-            {
-                var size = doc.PageSizes[i];
-                float scale = targetWidth / size.Width;
-                int width = targetWidth;
-                int height = Math.Max(1, (int)(size.Height * scale));
-                using var rendered = doc.Render(i, width, height, 150, 150, PdfiumViewer.PdfRenderFlags.CorrectFromDpi);
-                // pdfium 的 Render 在某些版本下会忽略 width/height 而按 DPI 出大图,
-                // 这里再用 Bitmap 构造函数缩到目标尺寸,避免 sixel 编码后过大。
-                int finalH = Math.Max(1, (int)(targetWidth * rendered.Height / (double)rendered.Width));
-                using var image = new System.Drawing.Bitmap(rendered, new System.Drawing.Size(targetWidth, finalH));
-                var name = $"{Guid.NewGuid():N}.png";
-                var fullPath = System.IO.Path.Combine(assetDir, name);
-                image.Save(fullPath, System.Drawing.Imaging.ImageFormat.Png);
-                sb.Append($"<img src=\"{LocalFileUrl(fullPath)}\"/>\n\n");
-            }
+            var fileName = Path.GetFileName(path);
+            return $"<p><strong>PDF</strong>: {System.Text.RegularExpressions.Regex.Escape(fileName)}</p>\n\n<p>终端暂不支持阅读 PDF,已保存到 imported/ 目录。如需阅读,请等待后续 web 端适配。</p>\n\n";
         }
-        catch { /* PDF 渲染失败返回已处理页面(可能为空) */ }
-        return sb.ToString();
+        catch { return "<p>PDF 文件(暂不支持终端阅读)</p>\n\n"; }
     }
 
-    // 本地绝对路径 -> file:// URL(正确转义空格/中文)。HtmlToMarkdown 原样保留绝对
+    // PalmDOC (MOBI) 解压缩。MOBI 文本记录使用此格式,是 LZ77 的简单实现。
+    static byte[] PalmDocDecompress(byte[] data)
+    {
+        var output = new List<byte>(data.Length * 2);
+        int i = 0;
+        while (i < data.Length)
+        {
+            byte b = data[i++];
+            if (b <= 7)
+            {
+                // 字面量块:后面跟着 b+1 个字节
+                for (int j = 0; j <= b && i < data.Length; j++)
+                    output.Add(data[i++]);
+            }
+            else if (b <= 127)
+            {
+                // 单个字面量
+                output.Add(b);
+            }
+            else if (b <= 191)
+            {
+                // 2字节 LZ77
+                if (i >= data.Length) break;
+                byte b2 = data[i++];
+                int combined = ((b & 0x3F) << 8) | b2;
+                int offset = (combined >> 3) + 1;
+                int length = (combined & 0x07) + 3;
+                int start = output.Count - offset;
+                if (start < 0) start = 0;
+                for (int j = 0; j < length; j++)
+                    output.Add(output[start + (j % Math.Max(offset, 1))]);
+            }
+            else
+            {
+                // 1字节 LZ77
+                int offset = ((b >> 3) & 0x07) + 1;
+                int length = (b & 0x07) + 3;
+                int start = output.Count - offset;
+                if (start < 0) start = 0;
+                for (int j = 0; j < length; j++)
+                    output.Add(output[start + (j % Math.Max(offset, 1))]);
+            }
+        }
+        return output.ToArray();
+    }
+
+    // MOBI 导入:解析 PalmDB/PalmDOC 格式,提取文本和图片。
+    // 支持无 DRM 的标准 MOBI/KF7 格式(压缩类型 1 = PalmDOC)。
+    static string ReadMobiFile(string path, string assetDir)
+    {
+        try
+        {
+            var data = File.ReadAllBytes(path);
+            using var ms = new MemoryStream(data);
+            using var br = new BinaryReader(ms);
+
+            // PDB Header (78 bytes)
+            br.ReadBytes(32); // name
+            br.ReadBytes(24); // attributes, version, dates, modificationNumber, appInfoID, sortInfoID
+            var typeStr = Encoding.ASCII.GetString(br.ReadBytes(4));
+            var creatorStr = Encoding.ASCII.GetString(br.ReadBytes(4));
+            br.ReadBytes(8); // uniqueIDSeed, nextRecordListID
+            ushort numRecords = br.ReadUInt16();
+
+            // Record Info Array (8 bytes each)
+            var records = new List<(uint offset, byte attr)>();
+            for (int r = 0; r < numRecords; r++)
+            {
+                uint offset = br.ReadUInt32();
+                byte attr = br.ReadByte();
+                br.ReadBytes(3); // uniqueId
+                records.Add((offset, attr));
+            }
+
+            if (records.Count < 2)
+                return "<p>MOBI 文件解析失败(记录数不足)</p>";
+
+            // Record 0: PalmDOC Header (16 bytes) + MOBI Header
+            ms.Position = records[0].offset;
+            ushort compression = br.ReadUInt16();
+            br.ReadBytes(2); // unused
+            uint textLength = br.ReadUInt32();
+            ushort recordCount = br.ReadUInt16();
+            ushort recordSize = br.ReadUInt16();
+            br.ReadBytes(4); // currentPosition
+
+            // MOBI Header
+            var mobiId = Encoding.ASCII.GetString(br.ReadBytes(4));
+            if (mobiId != "MOBI")
+                return "<p>MOBI 文件格式错误(无 MOBI 标识符)</p>";
+
+            uint headerLength = br.ReadUInt32();
+            br.ReadBytes(0x68 - 8); // 跳到 firstImageIndex (offset 0x6C from MOBI start)
+            uint firstImageIndex = br.ReadUInt32();
+
+            // 解压文本记录
+            var sb = new System.Text.StringBuilder();
+            int textRecordEnd = (firstImageIndex > 0 && firstImageIndex < records.Count)
+                ? (int)firstImageIndex
+                : Math.Min(records.Count, 1 + recordCount);
+
+            for (int r = 1; r < textRecordEnd && r < records.Count; r++)
+            {
+                uint start = records[r].offset;
+                uint end = (r + 1 < records.Count) ? records[r + 1].offset : (uint)data.Length;
+                int len = (int)(end - start);
+                if (len <= 0) continue;
+
+                byte[] recordData = new byte[len];
+                ms.Position = start;
+                ms.Read(recordData, 0, len);
+
+                byte[] text = compression == 1
+                    ? PalmDocDecompress(recordData)
+                    : recordData;
+
+                // MOBI 文本通常是 CP1252 或 UTF-8,优先试 UTF-8
+                string txt;
+                try { txt = Encoding.UTF8.GetString(text); }
+                catch { txt = Encoding.GetEncoding(1252).GetString(text); }
+                sb.Append(txt);
+            }
+
+            string html = sb.ToString();
+
+            // 提取图片
+            if (firstImageIndex > 0 && firstImageIndex < records.Count)
+            {
+                for (int r = (int)firstImageIndex; r < records.Count; r++)
+                {
+                    uint start = records[r].offset;
+                    uint end = (r + 1 < records.Count) ? records[r + 1].offset : (uint)data.Length;
+                    int len = (int)(end - start);
+                    if (len <= 0) continue;
+
+                    byte[] imgData = new byte[len];
+                    ms.Position = start;
+                    ms.Read(imgData, 0, len);
+
+                    string? ext = ImageExtFromMagic(imgData);
+                    if (ext == null) continue;
+
+                    string name = $"{Guid.NewGuid():N}{ext}";
+                    File.WriteAllBytes(Path.Combine(assetDir, name), imgData);
+                    html += $"<img src=\"{LocalFileUrl(Path.Combine(assetDir, name))}\"/>\n\n";
+                }
+            }
+
+            // 清理 MOBI 特有标签,转成标准 HTML
+            html = System.Text.RegularExpressions.Regex.Replace(html, @"<mbp:pagebreak\s*/?>", "\n\n", RegexOptions.IgnoreCase);
+            html = System.Text.RegularExpressions.Regex.Replace(html, @"<a[^>]*filepos=[^>]*>", "", RegexOptions.IgnoreCase);
+            html = System.Text.RegularExpressions.Regex.Replace(html, @"</a>", "", RegexOptions.IgnoreCase);
+            // 移除 <guide>, <ncx> 等导航标签的内容
+            html = System.Text.RegularExpressions.Regex.Replace(html, @"<(guide|ncx)[^>]*>.*?</\1>", "", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+            return string.IsNullOrWhiteSpace(html) ? "<p>MOBI 文件内容为空</p>" : html;
+        }
+        catch (Exception ex)
+        {
+            return $"<p>MOBI 文件解析失败: {System.Text.RegularExpressions.Regex.Escape(ex.Message)}</p>";
+        }
+    }
+
+// 本地绝对路径 -> file:// URL(正确转义空格/中文)。HtmlToMarkdown 原样保留绝对
     // URL,ImageSixel.FetchImageBytes 再用 Uri.LocalPath 读回本地字节。
     static string LocalFileUrl(string absPath) => new Uri(absPath).AbsoluteUri;
 
@@ -827,6 +983,7 @@ static string ReadTextFile(string path)
             ".txt" or ".md" or ".markdown" => ReadTextFile(path),
             ".pdf" => ReadPdfFile(path, assetDir),
             ".epub" => ReadEpubFile(path, assetDir),
+            ".mobi" => ReadMobiFile(path, assetDir),
             ".docx" => ReadDocxFile(path, assetDir),
             _ => throw new NotSupportedException($"Unsupported file type: {ext}")
         };
@@ -857,9 +1014,9 @@ static void ImportCli(string[] args, string dbPath)
     }
 
     var ext = Path.GetExtension(filePath).ToLowerInvariant();
-    if (ext is not (".txt" or ".md" or ".markdown" or ".pdf" or ".epub" or ".docx"))
+    if (ext is not (".txt" or ".md" or ".markdown" or ".pdf" or ".epub" or ".mobi" or ".docx"))
     {
-        ReportError("UNSUPPORTED_FORMAT", Lang.T("Unsupported file type: {0}. Supported: txt, md, pdf, epub, docx", ext), json: json);
+        ReportError("UNSUPPORTED_FORMAT", Lang.T("Unsupported file type: {0}. Supported: txt, md, pdf, epub, mobi, docx", ext), json: json);
         return;
     }
 
@@ -2931,7 +3088,8 @@ static async Task RunCli(string[] args, string dbPath)
             return;
         }
         bool json = args.Contains("--json", StringComparer.OrdinalIgnoreCase);
-        if (json) ShowArticleJson(sNum, dbPath);
+        bool vision = args.Contains("--vision", StringComparer.OrdinalIgnoreCase);
+        if (json) ShowArticleJson(sNum, dbPath, vision);
         else
         {
             if (!ArticleExists(sNum, dbPath)) { SetExit(); Console.WriteLine(Lang.T("Article {0} not found", sNum)); return; }
@@ -3163,7 +3321,7 @@ static void PrintHelp()
     Console.WriteLine(Lang.T("  -una, --unarchive unarchive a feed"));
     Console.WriteLine(Lang.T("  -r, --remove     delete a feed (add --yes to skip confirmation)"));
     Console.WriteLine(Lang.T("  pic              TUI with article images on (sixel); images are OFF by default — terminal sixel detection is unreliable"));
-    Console.WriteLine(Lang.T("  --show <id>      fullscreen reading (no sidebar; W = full TUI, Esc = exit); add --json to output raw content for AI/scripts"));
+    Console.WriteLine(Lang.T("  --show <id>      fullscreen reading (no sidebar; W = full TUI, Esc = exit); add --json to output raw content; add --vision to download images to temp dir"));
     Console.WriteLine(Lang.T("  --versions <id>  list all versions of an article (use --show <id> to view one)"));
     Console.WriteLine(Lang.T("  --diff <id> [vA vB]  diff two versions of an article (default: last two); --json for structured output"));
     Console.WriteLine(Lang.T("  --export <id | feed:N | all> [out.md|dir]  export article(s) as Markdown (--yes to skip confirm)"));
@@ -3171,7 +3329,7 @@ static void PrintHelp()
     Console.WriteLine(Lang.T("  --purge-fulltext [id]  clear the full-text cache"));
     Console.WriteLine(Lang.T("  --feed-info <n>  source identity & health (type/author/site/updated/status; --json)"));
     Console.WriteLine(Lang.T("  --export-opml [file]  export feeds as OPML; --import-opml <file>  import feeds"));
-    Console.WriteLine(Lang.T("  --import <file> [--title <name>]  import local file (txt/md/pdf/epub/docx)"));
+    Console.WriteLine(Lang.T("  --import <file> [--title <name>]  import local file (txt/md/pdf/epub/mobi/docx)"));
     Console.WriteLine(Lang.T("  --import-rm <id> [--yes]  remove an imported file"));
     Console.WriteLine(Lang.T("  --like <id> [--ai [reason]]  mark an article (♥ user / 🤖 AI); --likes lists marks"));
     Console.WriteLine(Lang.T("  --today [--json]  today's curated reading list (rule-based; guides daily reading habit)"));
@@ -3667,6 +3825,8 @@ static void DeleteFeedByRealId(int realId, string dbPath)
     cmd.CommandText = "DELETE FROM Vectors WHERE FeedId = @id";
     cmd.Parameters.AddWithValue("@id", realId);
     cmd.ExecuteNonQuery();
+    cmd.CommandText = "DELETE FROM VectorsChunks WHERE FeedId = @id";
+    cmd.ExecuteNonQuery();
     cmd.CommandText = "DELETE FROM ItemsFts WHERE rowid IN (SELECT Id FROM Items WHERE FeedId = @id)";
     cmd.ExecuteNonQuery();
     cmd.CommandText = "DELETE FROM Items WHERE FeedId = @id";
@@ -3996,6 +4156,23 @@ static void InitDatabase(string dbPath)
         );
 
         CREATE UNIQUE INDEX IF NOT EXISTS UQ_Vectors_ItemModel ON Vectors (ItemId, ModelId);
+
+        -- 切块向量：导入电子书等长文按 chunk 切分后逐块嵌入（一个 item → 多条）。
+        -- 检索时按 item 聚合最高分，再与主表/sidecar 合并去重。
+        CREATE TABLE IF NOT EXISTS VectorsChunks (
+            ItemId      INTEGER NOT NULL,
+            FeedId      INTEGER NOT NULL,
+            ModelId     INTEGER NOT NULL,
+            ChunkIndex  INTEGER NOT NULL,
+            Vector      BLOB    NOT NULL,
+            Snippet     TEXT,               -- 该块纯文本片段（前 200 字），供结果展示/debug
+            PRIMARY KEY (ItemId, ModelId, ChunkIndex),
+            FOREIGN KEY (FeedId) REFERENCES Feeds(Id),
+            FOREIGN KEY (ItemId) REFERENCES Items(Id),
+            FOREIGN KEY (ModelId) REFERENCES Models(Id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunk_model ON VectorsChunks (ModelId);
+        CREATE INDEX IF NOT EXISTS idx_chunk_item ON VectorsChunks (ItemId, ModelId);
         CREATE INDEX IF NOT EXISTS idx_items_guid ON Items (Guid);
         CREATE INDEX IF NOT EXISTS idx_items_feedid ON Items (FeedId);
         CREATE INDEX IF NOT EXISTS idx_items_status ON Items (Status);
@@ -4324,7 +4501,8 @@ static bool ArticleExists(int itemId, string dbPath)
 
 // ══════════ 原文 JSON 直出（sip --show <文章编号> --json）：供 AI / 脚本读取 ═══════════
 // 不做任何渲染，标题/来源/链接/作者等元信息 + 原始正文（Content 原文，空则 Description）原样输出
-static void ShowArticleJson(int itemId, string dbPath)
+// --vision: 把文章中的图片下载到临时目录,在 JSON 中输出本地路径(供 AI 视觉模型使用)
+static void ShowArticleJson(int itemId, string dbPath, bool vision = false)
 {
     using var conn = OpenDb(dbPath);
     conn.Open();
@@ -4346,8 +4524,40 @@ static void ShowArticleJson(int itemId, string dbPath)
     string feed = r.IsDBNull(6) ? "" : r.GetString(6);
 
     var sig = GetSignal(itemId);
-    // 有全文缓存时合并输出（AI 读全文主路径；无缓存则不出现该字段，避免误导）
     string? fulltext = ReadFulltextCache(itemId);
+    string articleContent = string.IsNullOrWhiteSpace(content) ? desc : content;
+
+    // --vision: 提取图片并下载到临时目录
+    List<string>? imagePaths = null;
+    if (vision)
+    {
+        imagePaths = new List<string>();
+        var imgMatches = System.Text.RegularExpressions.Regex.Matches(articleContent, @"<img[^>]*src=""([^""]+)""");
+        string tmpDir = Path.Combine(Path.GetTempPath(), $"sip-vision-{itemId}");
+        Directory.CreateDirectory(tmpDir);
+        int idx = 0;
+        foreach (System.Text.RegularExpressions.Match m in imgMatches)
+        {
+            string imgUrl = m.Groups[1].Value;
+            var bytes = FetchImageBytes(imgUrl);
+            if (bytes != null)
+            {
+                string ext = ".png";
+                if (bytes.Length > 4)
+                {
+                    if (bytes[0] == 0xFF && bytes[1] == 0xD8) ext = ".jpg";
+                    else if (bytes[0] == 0x89 && bytes[1] == 0x50) ext = ".png";
+                    else if (bytes[0] == 0x47 && bytes[1] == 0x49) ext = ".gif";
+                }
+                string imgPath = Path.Combine(tmpDir, $"img{idx}{ext}");
+                File.WriteAllBytes(imgPath, bytes);
+                imagePaths.Add(imgPath);
+                idx++;
+            }
+        }
+        if (imagePaths.Count == 0) imagePaths = null;
+    }
+
     JsonOut(new
     {
         success = true,
@@ -4362,8 +4572,9 @@ static void ShowArticleJson(int itemId, string dbPath)
             quality = ContentQuality(content, desc),
             liked = sig?.UserLike ?? false,
             aiLiked = sig?.AiLike ?? false,
-            content = string.IsNullOrWhiteSpace(content) ? desc : content,
-            fulltext = fulltext
+            content = articleContent,
+            fulltext = fulltext,
+            images = imagePaths
         }
     });
 }
@@ -5182,6 +5393,8 @@ static void DeleteFeed(int displayNum, string dbPath, bool yes = false)
     // 2. 先删该源的向量和文章
     cmd.CommandText = "DELETE FROM Vectors WHERE FeedId = @id";
     cmd.ExecuteNonQuery();
+    cmd.CommandText = "DELETE FROM VectorsChunks WHERE FeedId = @id";
+    cmd.ExecuteNonQuery();
     cmd.CommandText = "DELETE FROM Items WHERE FeedId = @id";
     cmd.ExecuteNonQuery();
 
@@ -5458,6 +5671,7 @@ static AiConfig LoadConfig(string dbPath)
         catch { /* 配置损坏时用默认值 */ }
     }
     cfg ??= new AiConfig();
+    cfg.Chunking ??= new ChunkingCfg();
     // 容错：手写/旧配置缺协议头时补全（静默，不打扰用户）
     cfg.Embedding.ApiEndpoint = NormalizeEndpoint(cfg.Embedding.ApiEndpoint);
     cfg.Llm.ApiEndpoint = NormalizeEndpoint(cfg.Llm.ApiEndpoint);
@@ -5713,6 +5927,178 @@ static void SaveVector(string dbPath, int feedId, int itemId, int modelId, float
     cmd.ExecuteNonQuery();
 }
 
+// ══════════ 长文切块（导入电子书等）═══════════
+// 默认 2000 token/块、200 token 重叠（见 ChunkingCfg）。token 数为近似值。
+
+// 估算 token 数：CJK 字符≈1 token，其他非空白字符≈0.3 token（拉丁≈4字符/token）
+static int EstimateTokens(string s)
+{
+    if (string.IsNullOrEmpty(s)) return 0;
+    int cjk = 0, other = 0;
+    foreach (char c in s)
+    {
+        if (c >= 0x4E00 && c <= 0x9FFF) cjk++;
+        else if (!char.IsWhiteSpace(c)) other++;
+    }
+    return (int)(cjk + other * 0.3);
+}
+
+// 把超长单段落按字符预算切碎（避免单块超过目标 token）
+static List<string> SplitLongParagraph(string p, int sizeTokens)
+{
+    int charBudget = Math.Max(200, sizeTokens * 2); // ≈目标 token 的字符预算（混合文安全）
+    if (p.Length <= charBudget) return new List<string> { p };
+    var pieces = new List<string>();
+    for (int i = 0; i < p.Length; i += charBudget)
+        pieces.Add(p.Substring(i, Math.Min(charBudget, p.Length - i)));
+    return pieces;
+}
+
+// 按段落切块：累积到 ≈sizeTokens 切一刀，块间保留 ≈overlapTokens 的重叠文本；
+// 单段落超过目标则先切碎。返回块列表（每块可能含多段，段间以空行分隔）。
+static List<string> ChunkText(string text, int sizeTokens, int overlapTokens)
+{
+    var result = new List<string>();
+    if (string.IsNullOrWhiteSpace(text)) return result;
+    var paras = new List<string>();
+    foreach (var rp in text.Split("\n\n", StringSplitOptions.None))
+    {
+        var t = rp.Trim();
+        if (t.Length == 0) continue;
+        if (EstimateTokens(t) > sizeTokens) paras.AddRange(SplitLongParagraph(t, sizeTokens));
+        else paras.Add(t);
+    }
+    if (paras.Count == 0) return result;
+
+    var cur = new List<string>();
+    int curTokens = 0;
+    foreach (var p in paras)
+    {
+        int pTokens = EstimateTokens(p);
+        if (curTokens + pTokens > sizeTokens && cur.Count > 0)
+        {
+            result.Add(string.Join("\n\n", cur));
+            // 重叠：从末尾回取约 overlapTokens 的文本作为下一块开头
+            int acc = 0;
+            var overlap = new List<string>();
+            for (int j = cur.Count - 1; j >= 0; j--)
+            {
+                int t = EstimateTokens(cur[j]);
+                if (acc + t > overlapTokens) break;
+                overlap.Insert(0, cur[j]);
+                acc += t;
+            }
+            cur = overlap;
+            curTokens = acc;
+        }
+        cur.Add(p);
+        curTokens += pTokens;
+    }
+    if (cur.Count > 0) result.Add(string.Join("\n\n", cur));
+    return result;
+}
+
+// 保存单条 chunk 向量（幂等：同 item+model+index 覆盖）
+static void SaveChunkVector(string dbPath, int feedId, int itemId, int modelId, int chunkIndex, float[] vector, string snippet)
+{
+    using var conn = OpenDb(dbPath);
+    conn.Open();
+    var cmd = conn.CreateCommand();
+    cmd.CommandText = @"
+        INSERT INTO VectorsChunks (ItemId, FeedId, ModelId, ChunkIndex, Vector, Snippet)
+        VALUES (@i, @f, @m, @ci, @v, @s)
+        ON CONFLICT(ItemId, ModelId, ChunkIndex) DO UPDATE SET
+            FeedId = excluded.FeedId, Vector = excluded.Vector, Snippet = excluded.Snippet
+    ";
+    cmd.Parameters.AddWithValue("@i", itemId);
+    cmd.Parameters.AddWithValue("@f", feedId);
+    cmd.Parameters.AddWithValue("@m", modelId);
+    cmd.Parameters.AddWithValue("@ci", chunkIndex);
+    cmd.Parameters.AddWithValue("@v", VectorToBytes(vector));
+    cmd.Parameters.AddWithValue("@s", snippet);
+    cmd.ExecuteNonQuery();
+}
+
+// 给单篇文章切块嵌入：正文「超长」才切块，短文章单向量已足够，省去无用切块。
+// 文本来源：RSS 优先用全文缓存（整篇正文），否则回退 Content（导入整本/摘要）。
+static async Task EmbedItemChunks(string dbPath, int feedId, int itemId, int modelId, AiConfig cfg)
+{
+    // 1) 取文本：RSS 有全文缓存则用它（整篇正文），否则回退 Items.Content
+    string? text = ReadFulltextCache(itemId);
+    if (string.IsNullOrWhiteSpace(text))
+    {
+        try
+        {
+            using var conn = OpenDb(dbPath);
+            conn.Open();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT Content FROM Items WHERE Id = @id";
+            cmd.Parameters.AddWithValue("@id", itemId);
+            var r = cmd.ExecuteScalar();
+            text = r as string;
+        }
+        catch { return; }
+    }
+    if (string.IsNullOrWhiteSpace(text)) return;
+
+    string plain = StripHtml(text);
+    if (plain.Length > 200000) plain = plain.Substring(0, 200000); // 安全阀：超长截断
+    // 2) 只在超长时切块：正文 token 数超过阈值才切（统一 2000 token 为一块触发线），
+    //    否则标题/全文单向量已覆盖，无需切块。
+    if (EstimateTokens(plain) <= cfg.Chunking.SizeTokens) return;
+    var chunks = ChunkText(plain, cfg.Chunking.SizeTokens, cfg.Chunking.OverlapTokens);
+    if (chunks.Count <= 1) return;
+
+    // 清旧块（幂等重跑）
+    try
+    {
+        using var conn = OpenDb(dbPath);
+        conn.Open();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM VectorsChunks WHERE ItemId = @i AND ModelId = @m";
+        cmd.Parameters.AddWithValue("@i", itemId);
+        cmd.Parameters.AddWithValue("@m", modelId);
+        cmd.ExecuteNonQuery();
+    }
+    catch { }
+
+    int idx = 0;
+    foreach (var ch in chunks)
+    {
+        var vec = await SafeEmbed(ch, cfg, articleId: itemId, sourceId: feedId);
+        if (vec == null) continue;
+        string snippet = ch.Length > 200 ? ch.Substring(0, 200) : ch;
+        SaveChunkVector(dbPath, feedId, itemId, modelId, idx++, vec, snippet);
+    }
+}
+
+// 给「已有向量但还没切块」的文章补 chunk 向量（兼容旧库 / 部分失败重跑）。
+// 作用所有源：RSS 与导入项只要正文超长都会被切块（EmbedItemChunks 内部按长度自决）。
+static async Task<int> BackfillChunks(string dbPath, List<int> feedIds, int modelId, AiConfig cfg)
+{
+    if (feedIds == null || feedIds.Count == 0) return 0;
+    using var conn = OpenDb(dbPath);
+    conn.Open();
+    var cmd = conn.CreateCommand();
+    cmd.CommandText = @"
+        SELECT i.Id, i.FeedId FROM Items i
+        WHERE i.Status = 'active' AND i.FeedId IN (" + string.Join(",", feedIds) + @")
+          AND NOT EXISTS (SELECT 1 FROM VectorsChunks vc WHERE vc.ItemId = i.Id AND vc.ModelId = @m)
+    ";
+    cmd.Parameters.AddWithValue("@m", modelId);
+    var ids = new List<(int, int)>();
+    using var r = cmd.ExecuteReader();
+    while (r.Read()) ids.Add((r.GetInt32(0), r.GetInt32(1)));
+
+    int done = 0;
+    foreach (var (id, fid) in ids)
+    {
+        await EmbedItemChunks(dbPath, fid, id, modelId, cfg);
+        done++;
+    }
+    return done;
+}
+
 // ══════════ 交互式选择文章进行向量化 ══════════
 static async Task IndexArticlesCli(string[] extraArgs, string dbPath)
 {
@@ -5779,6 +6165,8 @@ static async Task IndexArticlesCli(string[] extraArgs, string dbPath)
             SaveConfig(dbPath, cfg);
         }
         SaveVector(dbPath, a.FeedId, a.Id, modelId, vec);
+        // 切块嵌入正文：超长文章自动切片（RSS/导入都走此路，短文章内部自决跳过）
+        await EmbedItemChunks(dbPath, a.FeedId, a.Id, modelId, cfg);
         ok++;
         if (ok % 10 == 0) Console.WriteLine(Lang.T("  processed {0}/{1}", ok + fail, articles.Count));
     }
@@ -5787,6 +6175,10 @@ static async Task IndexArticlesCli(string[] extraArgs, string dbPath)
     // 回补全文 sidecar：已抓全文但当时未索引的文章补向量（修复时序缺陷）
     int backfilled = BackfillFulltextSidecars(dbPath, articles.Select(a => (a.Id, a.FeedId)).ToList());
     if (backfilled > 0) Console.WriteLine(Lang.T("Fulltext sidecar vectors backfilled: {0}", backfilled));
+
+    // 回补切块：已嵌标题但还没切块的旧文章（兼容旧库 / 部分失败重跑），所有源都覆盖
+    int chunked = await BackfillChunks(dbPath, feedIds, modelId, cfg);
+    if (chunked > 0) Console.WriteLine(Lang.T("Long-article chunks embedded: {0}", chunked));
 }
 
 // 重新向量化（更换模型后）：清空旧向量并重来
@@ -5806,6 +6198,8 @@ static async Task ReindexCli(string dbPath)
 
     cmd.CommandText = "DELETE FROM Vectors";
     cmd.ExecuteNonQuery();
+    cmd.CommandText = "DELETE FROM VectorsChunks";
+    cmd.ExecuteNonQuery();
     // 换模型后旧 sidecar 向量（抓取全文的）同样失效，一并清空
     if (File.Exists(FulltextVecsPath())) { try { File.Delete(FulltextVecsPath()); } catch { } }
 
@@ -5815,6 +6209,7 @@ static async Task ReindexCli(string dbPath)
     var items = new List<(int Id, int FeedId, string Title)>();
     while (r.Read()) items.Add((r.GetInt32(0), r.GetInt32(1), r.GetString(2)));
     r.Close();
+    var allFeedIds = items.Select(x => x.FeedId).Distinct().ToList();
 
     int ok = 0, fail = 0;
     foreach (var item in items)
@@ -5822,6 +6217,8 @@ static async Task ReindexCli(string dbPath)
         var vec = await SafeEmbed(item.Title, cfg, articleId: item.Id, sourceId: item.FeedId);
         if (vec == null) { fail++; continue; }
         SaveVector(dbPath, item.FeedId, item.Id, modelId, vec);
+        // 切块嵌入正文：超长文章自动切片（RSS/导入都走此路，短文章内部自决跳过）
+        await EmbedItemChunks(dbPath, item.FeedId, item.Id, modelId, cfg);
         ok++;
         if ((ok + fail) % 10 == 0) Console.WriteLine(Lang.T("  processed {0}/{1}", ok + fail, items.Count));
     }
@@ -5830,6 +6227,10 @@ static async Task ReindexCli(string dbPath)
     // 换模型后旧全文 sidecar 已清空，给有全文缓存的文章重算
     int backfilled = BackfillFulltextSidecars(dbPath, items.Select(a => (a.Id, a.FeedId)).ToList());
     if (backfilled > 0) Console.WriteLine(Lang.T("Fulltext sidecar vectors backfilled: {0}", backfilled));
+
+    // 长文切块：reindex 已清空 VectorsChunks，这里把所有源中超长文章重新切块嵌入
+    int chunked = await BackfillChunks(dbPath, allFeedIds, modelId, cfg);
+    if (chunked > 0) Console.WriteLine(Lang.T("Long-article chunks embedded: {0}", chunked));
 }
 
 // ══════════ 语义搜索 ══════════
@@ -6249,8 +6650,10 @@ static List<SearchHit>? DoSearch(string query, string dbPath, int? feedReal = nu
     var cmd = conn.CreateCommand();
     cmd.CommandText = "SELECT COUNT(*) FROM Vectors WHERE ModelId = @m";
     cmd.Parameters.AddWithValue("@m", modelId);
-    long count = (long)cmd.ExecuteScalar()!;
-    if (count == 0) { ReportError("NO_INDEX", Lang.T("The current model has no vectors yet, run sip --index first"), json: json); return null; }
+    long vCount = (long)cmd.ExecuteScalar()!;
+    cmd.CommandText = "SELECT COUNT(*) FROM VectorsChunks WHERE ModelId = @m";
+    long cCount = (long)cmd.ExecuteScalar()!;
+    if (vCount == 0 && cCount == 0) { ReportError("NO_INDEX", Lang.T("The current model has no vectors yet, run sip --index first"), json: json); return null; }
 
     cmd.Parameters.Clear();
     cmd.CommandText = @"
@@ -6298,6 +6701,43 @@ static List<SearchHit>? DoSearch(string query, string dbPath, int? feedReal = nu
         if (score < thr) continue;
         var hit = GetSearchHitForItem(dbPath, sid, score);
         if (hit != null) { results.Add(hit); seen.Add(sid); }
+    }
+
+    // 合并切块向量（导入电子书等长文）：每 item 取最高分；
+    // 已在结果里则取更优分，未命中则补入。块数可能很多，先聚合成每 item 最高分。
+    var chunkBest = new Dictionary<int, float>();
+    using (var rc = conn.CreateCommand())
+    {
+        rc.CommandText = @"
+            SELECT vc.ItemId, vc.Vector FROM VectorsChunks vc
+            JOIN Items i ON vc.ItemId = i.Id
+            WHERE vc.ModelId = @m AND i.Status = 'active'
+            " + (feedReal.HasValue ? "AND vc.FeedId = @fid" : "") + @"
+        ";
+        rc.Parameters.AddWithValue("@m", modelId);
+        if (feedReal.HasValue) rc.Parameters.AddWithValue("@fid", feedReal.Value);
+        using var rr = rc.ExecuteReader();
+        while (rr.Read())
+        {
+            int cid = rr.GetInt32(0);
+            float[] cvec = BytesToVector(rr.GetFieldValue<byte[]>(1));
+            float s = CosineSimilarity(vec, cvec);
+            if (s < thr) continue;
+            if (!chunkBest.TryGetValue(cid, out float prev) || s > prev) chunkBest[cid] = s;
+        }
+    }
+    foreach (var kv in chunkBest)
+    {
+        var existing = results.FirstOrDefault(h => h.ItemId == kv.Key);
+        if (existing != null)
+        {
+            if (kv.Value > existing.Score) existing.Score = kv.Value;
+        }
+        else if (!seen.Contains(kv.Key))
+        {
+            var hit = GetSearchHitForItem(dbPath, kv.Key, kv.Value);
+            if (hit != null) { results.Add(hit); seen.Add(kv.Key); }
+        }
     }
 
     return results.OrderByDescending(h => h.Score).Take(20).ToList();
@@ -6369,6 +6809,8 @@ static void DeleteArticleByGuid(string guid, string dbPath)
     conn.Open();
     var cmd = conn.CreateCommand();
     cmd.CommandText = "DELETE FROM Vectors WHERE ItemId IN (SELECT Id FROM Items WHERE Guid = @g)";
+    cmd.ExecuteNonQuery();
+    cmd.CommandText = "DELETE FROM VectorsChunks WHERE ItemId IN (SELECT Id FROM Items WHERE Guid = @g)";
     cmd.Parameters.AddWithValue("@g", guid);
     cmd.ExecuteNonQuery();
     cmd.CommandText = "DELETE FROM ItemsFts WHERE rowid IN (SELECT Id FROM Items WHERE Guid = @g)";
@@ -7067,6 +7509,17 @@ class AiConfig
     public LlmCfg Llm { get; set; } = new();
     // 全文抓取安全策略：默认拦截私网地址（SSRF 防护），内网源可设 true 放行
     public bool AllowPrivateNet { get; set; } = false;
+    // 长文切块（导入电子书等）：每个 chunk 的目标 token 数与重叠 token 数
+    public ChunkingCfg Chunking { get; set; } = new();
+}
+
+// 切块配置：默认 2000 token/块、200 token 重叠（≈10%）。
+// token 数为近似值（按 CJK≈1 / 拉丁≈0.3 估算），目的是把长文切成模型可吃下的小块，
+// 不必精确；实际块大小会落在模型上下文上限（通常 8192+）以内。
+class ChunkingCfg
+{
+    public int SizeTokens { get; set; } = 2000;
+    public int OverlapTokens { get; set; } = 200;
 }
 
 class EmbeddingCfg

@@ -289,8 +289,9 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
         var progressMap = LoadReadingProgress();
         long _currentArticleId = 0;
         int _savedScrollY = -1;   // 打开文章时若检测到历史进度，存这里；-1 = 无
-        bool _pageFlipMode = false;   // false=滚动模式,true=翻页模式(PDF 强制 true)
-        bool _isPdfArticle = false;   // 当前文章是否为 PDF 导入(强制翻页,不可切换)
+        bool _pageFlipMode = false;   // false=滚动模式,true=翻页模式
+        bool _hasImages = false;      // 当前文章是否含图片（决定状态栏是否提示 pic）
+        bool _currentIsImported = false;  // 当前文章是否属于「本地导入」源（local://import）
 
         // —— Telemetry 阅读状态（仅内存，会话内）——
         double _maxProgress = 0;      // 当前文章最大进度 0-1
@@ -375,15 +376,19 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
 
         void UpdateStats()
         {
+            // 当前文章有图片、图片未开、且非导入电子书时，提示可用 `pic` 开启
+            // （导入电子书在 TUI 不显示图片，提示会误导，故排除）
+            string imgHint = (_currentArticleId != 0 && _hasImages && !ImagesEnabled && !_currentIsImported)
+                ? " · 按 Esc 输 pic 看图片(sixel,需终端支持)" : "";
             // 检测到阅读进度时，状态行优先显示跳转提示（标题栏会截断，这里更显眼）
             if (_savedScrollY > 0)
             {
-                statsLabel.Text = Lang.T("▷ 按 Space 跳回上次位置");
+                statsLabel.Text = Lang.T("▷ 按 Space 跳回上次位置") + imgHint;
                 return;
             }
             var (cur, tot) = tree.ArticlePosition();
-            string modeHint = _isPdfArticle ? "[PDF]" : (_pageFlipMode ? "[Flip]" : "[Scroll]");
-            statsLabel.Text = Lang.T("feeds {0} · article {1}/{2} · {3}", _statsFeeds, cur, Math.Max(_statsArticles, tot), modeHint);
+            string modeHint = _pageFlipMode ? "[Flip]" : "[Scroll]";
+            statsLabel.Text = Lang.T("feeds {0} · article {1}/{2} · {3}", _statsFeeds, cur, Math.Max(_statsArticles, tot), modeHint) + imgHint;
             top.Title = $" sip RSS Reader · {Lang.T("feeds {0}", _statsFeeds)} ";
         }
 
@@ -524,26 +529,30 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
             if (n == null || n.IsFeed)
             {
                 TelemetryCloseArticle();               // 从文章切到源/空 → 主动离开
-                contentView.Text = ""; _currentArticleId = 0; _savedScrollY = -1; UpdateStats();
+                contentView.Text = ""; _currentArticleId = 0; _currentIsImported = false; _savedScrollY = -1; UpdateStats();
                 return;
             }
             if (n.ItemId != _currentArticleId)
             {
                 TelemetryCloseArticle();               // 主动切换 → 低进度记 skip
                 _lastBaseUrl = GetArticleLink(n.ItemId, dbPath);
-                contentView.Text = BuildArticleMarkdown(n.ItemId, contentMode, dbPath, contentView.GetContentWidth(), showFetchHint: true);
                 _currentArticleId = n.ItemId;
-                _isPdfArticle = _lastBaseUrl.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
-                if (_isPdfArticle) _pageFlipMode = true;   // PDF 强制翻页
+                _currentIsImported = IsItemImported(n.ItemId, dbPath);
                 TelemetryOpenArticle(n.ItemId, n.FeedId);   // article_open + 计时初始化
             }
             else
             {
                 _lastBaseUrl = GetArticleLink(n.ItemId, dbPath);
-                contentView.Text = BuildArticleMarkdown(n.ItemId, contentMode, dbPath, contentView.GetContentWidth(), showFetchHint: true);
             }
-            // 文章渲染完立刻把图片丢给后台预取。渲染线程不等网络/解码,
-            // 图到货后由 SipMarkdown.OnImageReady 通知重绘。
+            // 渲染：导入电子书在 TUI 不显示图片（DB/JSON 仍保留图片引用，供 AI/vision 使用）
+            bool showImages = ImagesEnabled && !_currentIsImported;
+            TuiMdState.ReserveImageSpace = showImages;
+            contentView.EnableSixelImages = showImages;
+            string md = BuildArticleMarkdown(n.ItemId, contentMode, dbPath, contentView.GetContentWidth(), showFetchHint: true);
+            _hasImages = MdImageUrlRegex.IsMatch(md);
+            if (_currentIsImported) md = StripImageMarkdown(md);
+            contentView.Text = md;
+            // 文章渲染完立刻把图片丢给后台预取（仅 RSS 等需要显示图片的来源）
             PrefetchArticleImages(contentView.Text, _lastBaseUrl);
             // 检测到历史进度 → 提示（不自动跳，等用户按 Space）；非法值直接忽略
             _savedScrollY = progressMap.TryGetValue(n.ItemId, out int y) && y > 0 ? y : -1;
@@ -555,7 +564,13 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
         void ShowSelectedVersion(long itemId, int version)
         {
             contentMode = true;   // 历史版本固定用完整正文
-            contentView.Text = BuildArticleMarkdown(itemId, true, dbPath, contentView.GetContentWidth());
+            bool showImages = ImagesEnabled && !_currentIsImported;
+            TuiMdState.ReserveImageSpace = showImages;
+            contentView.EnableSixelImages = showImages;
+            string md = BuildArticleMarkdown(itemId, true, dbPath, contentView.GetContentWidth());
+            _hasImages = MdImageUrlRegex.IsMatch(md);
+            if (_currentIsImported) md = StripImageMarkdown(md);
+            contentView.Text = md;
             PrefetchArticleImages(contentView.Text, _lastBaseUrl);
             contentView.Title = " " + Lang.T("Content") + " · v" + version + " ";
             contentView.SetFocus();
@@ -1086,11 +1101,8 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
                     e.Handled = true;
                     break;
                 case KeyCode.Tab:
-                    if (!_isPdfArticle)
-                    {
-                        _pageFlipMode = !_pageFlipMode;
-                        UpdateStats();
-                    }
+                    _pageFlipMode = !_pageFlipMode;
+                    UpdateStats();
                     e.Handled = true;
                     break;
                 case KeyCode.CursorUp:
@@ -1322,20 +1334,31 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
                     // 吞掉 sixel,探测说"支持"、实际一张图都出不来还会让画面错乱。
                     // 所以不做自动判断,由用户在确认自己终端 OK 的前提下手动打开。
                     ImagesEnabled = !ImagesEnabled;
-                    TuiMdState.ReserveImageSpace = ImagesEnabled;
-                    contentView.EnableSixelImages = ImagesEnabled;
 
-                    // 垂直留白是写进 Markdown 文本的(ReserveImageSpace 控制),
-                    // 开关变了必须重新生成,否则开着图时没留空间会压住正文、
-                    // 关了图却留着 20 行空白。
                     if (_currentArticleId != 0)
                     {
-                        contentView.Text = BuildArticleMarkdown(
+                        // 导入电子书即使在 TUI 开了 pic 也不显示图片（TUI 不读电子书图）
+                        bool showImages = ImagesEnabled && !_currentIsImported;
+                        TuiMdState.ReserveImageSpace = showImages;
+                        contentView.EnableSixelImages = showImages;
+
+                        // 垂直留白是写进 Markdown 文本的(ReserveImageSpace 控制),
+                        // 开关变了必须重新生成,否则开着图时没留空间会压住正文、
+                        // 关了图却留着 20 行空白。
+                        string md = BuildArticleMarkdown(
                             _currentArticleId, contentMode, dbPath,
                             contentView.GetContentWidth(), showFetchHint: true);
-                        if (ImagesEnabled) PrefetchArticleImages(contentView.Text, _lastBaseUrl);
+                        if (_currentIsImported) md = StripImageMarkdown(md);
+                        contentView.Text = md;
+                        if (showImages) PrefetchArticleImages(contentView.Text, _lastBaseUrl);
+                    }
+                    else
+                    {
+                        TuiMdState.ReserveImageSpace = ImagesEnabled;
+                        contentView.EnableSixelImages = ImagesEnabled;
                     }
                     contentView.SetNeedsDraw();
+                    UpdateStats();   // 图片开/关后刷新状态栏的 pic 提示
                     return;
                 }
                 case "manage":
@@ -1893,7 +1916,14 @@ static bool ShowFullscreenReader(int itemId, string dbPath)
     md.Height = Dim.Fill() - 1;
     md.CanFocus = true;
     md.Title = " " + Lang.T("Article") + " ";
-    md.Text = BuildArticleMarkdown(itemId, contentMode: true, dbPath, 90);
+    // 导入电子书在全屏阅读界面同样不显示图片（TUI 不读电子书图；DB/JSON 仍保留）
+    bool fsImported = IsItemImported(itemId, dbPath);
+    bool fsShow = ImagesEnabled && !fsImported;
+    TuiMdState.ReserveImageSpace = fsShow;
+    md.EnableSixelImages = fsShow;
+    string fsMd = BuildArticleMarkdown(itemId, contentMode: true, dbPath, 90);
+    if (fsImported) fsMd = StripImageMarkdown(fsMd);
+    md.Text = fsMd;
 
     var hint = new Label
     {
@@ -2477,6 +2507,37 @@ static SipMarkdown CreateMarkdownView()
 // sipcore 输出的图片语法固定是 `![\u200B](url)`(alt 恒为 ZWSP,见 sipcore 注释),
 // 但这里按通用 Markdown 图片语法匹配,不依赖 alt 的具体内容。
 static readonly Regex MdImageUrlRegex = new(@"!\[[^\]]*\]\(([^)\s]+)", RegexOptions.Compiled);
+
+/// <summary>
+/// 判断某篇文章是否属于「本地导入」虚拟源（FeedUrl = 'local://import'）。
+/// 导入的电子书(epub/docx/mobi/pdf)在 TUI 不显示图片,但 DB/JSON 仍保留图片引用。
+/// </summary>
+static bool IsItemImported(long itemId, string dbPath)
+{
+    try
+    {
+        using var conn = OpenDb(dbPath);
+        conn.Open();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT f.FeedUrl FROM Items i JOIN Feeds f ON i.FeedId = f.Id WHERE i.Id = @id";
+        cmd.Parameters.AddWithValue("@id", itemId);
+        var r = cmd.ExecuteScalar();
+        return r is string s && s == "local://import";
+    }
+    catch { return false; }
+}
+
+/// <summary>
+/// 从 Markdown 文本里剥离图片语法(及因此产生的多余空行)。
+/// 仅用于「导入电子书在 TUI 不显示图片」——DB 原文 / JSON 输出不受影响。
+/// </summary>
+static string StripImageMarkdown(string md)
+{
+    if (string.IsNullOrEmpty(md)) return md;
+    md = MdImageUrlRegex.Replace(md, "");          // 删 ![\u200B](url)
+    md = Regex.Replace(md, @"(\r?\n){3,}", "\n\n"); // 收敛删图后多余的连空行
+    return md;
+}
 
 /// <summary>
 /// 文章渲染后立刻把里面的图片丢给后台预取,避免首次打开带图文章时渲染线程

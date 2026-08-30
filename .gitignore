@@ -23,3 +23,9 @@ Thumbs.db
 
 ## Backup bundles
 *.bundle
+
+## WorkBuddy project memory (local data, don't commit)
+.workbuddy-ai/
+
+## Debug logs
+debug_log.txt
