@@ -1034,6 +1034,42 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
         // 正文栏：← 返回树；j/k/↑↓ 平滑滚动；Space/b/PageUp/PageDown 翻页；Ctrl+D/Ctrl+U 半页；
         //       l/Enter 打开当前链接；i 沉浸阅读；C 折叠侧栏；V 版本；Esc 命令行
         // 链接导航：Ctrl+O 进入/退出，Tab/Shift+Tab 切换链接，Enter/l 打开当前链接
+        // 翻页模式:不再自由滚动,改为按整屏高度吸附 + 翻页整屏清。
+        // 整屏清(ESC[2J)能清掉上一页的 sixel 像素(普通 FillRect 清不掉),
+        // 这是从根上消除"滚动黑屏/条纹/残影"这类 bug 的关键。
+        void ClearScreenForPageFlip()
+        {
+            try
+            {
+#pragma warning disable CS0618   // legacy 静态入口,本项目整体仍用
+                var drv = Terminal.Gui.App.Application.Driver;
+                if (drv != null)
+                {
+                    // 直接往终端写 ESC[2J + 光标归位,清掉上一页的 sixel 帧缓冲(普通 FillRect 清不掉)。
+                    // WriteRaw 是 IDriver 原生方法,能透传原始转义序列。
+                    string seq = EscSeqUtils.CSI_ClearScreen(EscSeqUtils.ClearScreenOptions.EntireScreen).ToString()
+                               + EscSeqUtils.CSI_SetCursorPosition(1, 1).ToString();
+                    drv.WriteRaw(seq);
+                    Terminal.Gui.App.Application.LayoutAndDraw(true);
+                }
+#pragma warning restore CS0618
+            }
+            catch { /* 清屏失败绝不阻断翻页 */ }
+        }
+
+        void PageFlip(Terminal.Gui.ViewBase.View cv, int dir)
+        {
+            int vh = cv.Viewport.Height;
+            if (vh <= 0) return;
+            int maxY = Math.Max(0, cv.GetContentHeight() - vh);
+            int cur = cv.Viewport.Y;
+            int target = dir > 0 ? Math.Min(maxY, cur + vh) : Math.Max(0, cur - vh);
+            if (target == cur) return;   // 已在首页/末页
+            cv.ScrollVertical(target - cur);
+            SaveCurrentScroll();
+            ClearScreenForPageFlip();
+        }
+
         contentView.KeyDown += (s, e) =>
         {
             switch (e.KeyCode)
@@ -1048,28 +1084,27 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
                 case KeyCode.K:
                     if (_savedScrollY > 0) { _savedScrollY = -1; UpdateStats(); }   // 手动滚动 → 撤掉跳转提示
                     if (linkNavMode) { CycleLink(-1); }
-                    else { TelemetryActivityTick(); contentView.ScrollVertical(-1); SaveCurrentScroll(); }
+                    else { TelemetryActivityTick(); PageFlip(contentView, -1); }
                     e.Handled = true;
                     break;
                 case KeyCode.CursorDown:
                 case KeyCode.J:
                     if (_savedScrollY > 0) { _savedScrollY = -1; UpdateStats(); }
                     if (linkNavMode) { CycleLink(1); }
-                    else { TelemetryActivityTick(); contentView.ScrollVertical(1); SaveCurrentScroll(); }
+                    else { TelemetryActivityTick(); PageFlip(contentView, +1); }
                     e.Handled = true;
                     break;
                 case KeyCode.PageUp:
                 case KeyCode.B:
                     if (_savedScrollY > 0) { _savedScrollY = -1; UpdateStats(); }
                     TelemetryActivityTick();
-                    contentView.ScrollVertical(-6);
-                    SaveCurrentScroll();
+                    PageFlip(contentView, -1);
                     e.Handled = true;
                     break;
                 case KeyCode.PageDown:
                 case KeyCode.Space:
                     if (_savedScrollY > 0) { JumpToSaved(); }   // 有历史进度 → Space 跳回
-                    else { TelemetryActivityTick(); contentView.ScrollVertical(6); SaveCurrentScroll(); }
+                    else { TelemetryActivityTick(); PageFlip(contentView, +1); }
                     e.Handled = true;
                     break;
                 case KeyCode.Enter:

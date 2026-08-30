@@ -130,22 +130,48 @@ public partial class Program
         });
     }
 
-    /// <summary>后台线程:下载 -> 解码 -> sixel 编码 -> 入缓存 -> 通知重绘。</summary>
+    /// <summary>
+    /// 取图片字节:同时支持 http(s) 与本地文件。
+    /// - http(s):走复用 HttpClient(8s 超时)。
+    /// - file:// 或裸本地路径:直接读磁盘。导入的电子书图片就是这么存的,
+    ///   HttpClient 抓不了 file://,必须单独处理。
+    /// 失败返回 null(调用方跳过该图,不阻塞渲染)。
+    /// </summary>
+    static byte[]? FetchImageBytes(string url)
+    {
+        // 本地文件:file:// 或裸路径。Uri.LocalPath 在 Windows 上把
+        // file:///C:/x.png 正确转成 C:\x.png,Linux 上 /home/x.png 原样返回。
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme == "file")
+        {
+            try { var b = File.ReadAllBytes(uri.LocalPath); return b.Length == 0 ? null : b; }
+            catch (Exception ex) { SixelLog($"  file read fail {uri.LocalPath}: {ex.Message}"); return null; }
+        }
+        if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            && !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            try { var b = File.ReadAllBytes(url); return b.Length == 0 ? null : b; }
+            catch (Exception ex) { SixelLog($"  local read fail {url}: {ex.Message}"); return null; }
+        }
+        // http(s)
+        try
+        {
+            var resp = ImageHttpClient.GetAsync(url).GetAwaiter().GetResult();
+            if (!resp.IsSuccessStatusCode) { SixelLog($"  HTTP {(int)resp.StatusCode}"); return null; }
+            var raw = resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+            return raw.Length == 0 ? null : raw;
+        }
+        catch (Exception ex) { SixelLog($"  http exception: {ex.Message}"); return null; }
+    }
+
+    /// <summary>后台线程:下载/读盘 -> 解码 -> sixel 编码 -> 入缓存 -> 通知重绘。</summary>
     static void DownloadAndCache(string url)
     {
         if (TuiImageCache.Map.ContainsKey(url)) return;
         try
         {
             SixelLog($"GET {url}");
-            var resp = ImageHttpClient.GetAsync(url).GetAwaiter().GetResult();
-            if (!resp.IsSuccessStatusCode)
-            {
-                SixelLog($"  HTTP {(int)resp.StatusCode}");
-                return;
-            }
-
-            var raw = resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
-            if (raw.Length == 0) return;
+            var raw = FetchImageBytes(url);
+            if (raw is null) return;
 
             var sixel = EncodeToSixel(raw);
             if (sixel is null || sixel.Length == 0)

@@ -30,6 +30,8 @@ using Terminal.Gui.Views;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Input;
 using Terminal.Gui.Text;
+using UglyToad.PdfPig;
+using UglyToad.PdfPig.Content;
 
 // 统一 UTF-8 输入/输出：避免中文在终端 / AI 调用（PowerShell 默认 GBK 代码页）时乱码，
 // 也保证管道输入的同意短语等中文内容按 UTF-8 解码
@@ -651,147 +653,221 @@ static string ReadTextFile(string path)
     return File.ReadAllText(path);
 }
 
-// 简易 PDF 文本提取（基于文本流解析，非完整 PDF 解析器）
-static string ReadPdfFile(string path)
-{
-    var bytes = File.ReadAllBytes(path);
-    var text = new System.Text.StringBuilder();
-    // 尝试提取 BT/ET 文本块（PDF 内嵌文本）
-    var content = System.Text.Encoding.Latin1.GetString(bytes);
-    int idx = 0;
-    while (idx < content.Length)
+// 按文件头魔法字节嗅探图片扩展名;返回 null 表示不支持(如 Ccitt/JBIG2 原始流)。
+    static string? ImageExtFromMagic(System.ReadOnlySpan<byte> b)
     {
-        int btStart = content.IndexOf("BT", idx);
-        if (btStart < 0) break;
-        int etEnd = content.IndexOf("ET", btStart + 2);
-        if (etEnd < 0) break;
-        var block = content[(btStart + 2)..etEnd];
-        // 提取 Tj/TJ 操作符中的文本
-        int pos = 0;
-        while (pos < block.Length)
-        {
-            int tj = block.IndexOf("Tj", pos);
-            int tjArr = block.IndexOf("TJ", pos);
-            int next = -1;
-            string? val = null;
-            if (tj >= 0 && (tjArr < 0 || tj < tjArr))
-            {
-                // (string)Tj
-                int parenStart = block.LastIndexOf('(', tj);
-                int parenEnd = block.IndexOf(')', tj);
-                if (parenStart >= 0 && parenEnd > parenStart)
-                    val = block[(parenStart + 1)..parenEnd];
-                next = tj + 2;
-            }
-            else if (tjArr >= 0)
-            {
-                // [array]TJ
-                int bracketStart = block.LastIndexOf('[', tjArr);
-                int bracketEnd = block.IndexOf(']', tjArr);
-                if (bracketStart >= 0 && bracketEnd > bracketStart)
-                {
-                    var arr = block[(bracketStart + 1)..bracketEnd];
-                    // 提取每个 (string) 元素
-                    var strParts = new List<string>();
-                    int si = 0;
-                    while (si < arr.Length)
-                    {
-                        int ps = arr.IndexOf('(', si);
-                        if (ps < 0) break;
-                        int pe = arr.IndexOf(')', ps);
-                        if (pe < 0) break;
-                        strParts.Add(arr[(ps + 1)..pe]);
-                        si = pe + 1;
-                    }
-                    val = string.Join("", strParts);
-                }
-                next = tjArr + 2;
-            }
-            if (val != null)
-            {
-                // 解码 PDF 转义
-                val = val.Replace("\\n", "\n").Replace("\\r", "\r").Replace("\\t", "\t")
-                         .Replace("\\(", "(").Replace("\\)", ")").Replace("\\\\", "\\");
-                text.Append(val);
-            }
-            pos = next > pos ? next : pos + 1;
-        }
-        idx = etEnd + 2;
+        if (b.Length < 4) return null;
+        if (b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return ".jpg";           // JPEG
+        if (b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) return ".png"; // PNG
+        if (b[0] == 0x47 && b[1] == 0x49 && b[2] == 0x46) return ".gif";           // GIF
+        if (b[0] == 0x42 && b[1] == 0x4D) return ".bmp";                           // BMP
+        if ((b[0] == 0x49 && b[1] == 0x49 && b[2] == 0x2A && b[3] == 0x00) ||
+            (b[0] == 0x4D && b[1] == 0x4D && b[2] == 0x00 && b[3] == 0x2A)) return ".tiff"; // TIFF
+        return null;
     }
-    if (text.Length > 0) return text.ToString();
-    // 回退：提取可读文本（连续 printable 字符 > 10）
-    var readable = new System.Text.StringBuilder();
-    var cur = new System.Text.StringBuilder();
-    for (int i = 0; i < bytes.Length; i++)
+
+// 简易 PDF 文本提取（基于文本流解析，非完整 PDF 解析器）
+    // PDF 导入:用 PdfPig 抽文本 + 图片(按页序)。图片落 assetDir,<img> 交 HtmlToMarkdown。
+    // 相比原 BT/ET 正则,PdfPig 同时能拿到 XObject 图片流,这才是"三种全做"里 PDF 保图的关键。
+    static string ReadPdfFile(string path, string assetDir)
     {
-        byte b = bytes[i];
-        if (b >= 32 && b < 127 || b == 10 || b == 13 || b >= 192)
+        var sb = new System.Text.StringBuilder();
+        try
         {
-            cur.Append((char)b);
+            using var doc = PdfDocument.Open(path);
+            foreach (var page in doc.GetPages())
+            {
+                var text = page.Text;
+                if (!string.IsNullOrWhiteSpace(text))
+                {
+                    sb.Append("<p>");
+                    sb.Append(System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ").Trim());
+                    sb.Append("</p>\n\n");
+                }
+                try
+                {
+                    foreach (var img in page.GetImages())
+                    {
+                        // 优先用 TryGetPng 把任意可解码图片归一化成 PNG(JPEG/Ccitt 等也最稳);
+                        // 失败再退回原始流并按魔法字节嗅探,只收 JPEG/PNG/GIF/BMP/TIFF。
+                        byte[]? data = null;
+                        string? ext;
+                        if (img.TryGetPng(out var png) && png != null && png.Length > 0)
+                        {
+                            data = png; ext = ".png";
+                        }
+                        else
+                        {
+                            var rb = img.RawBytes;          // Span<byte>
+                            if (rb.IsEmpty) continue;
+                            ext = ImageExtFromMagic(rb);    // ReadOnlySpan<byte> 重载
+                            if (ext == null) continue;      // Ccitt/JBIG2 等无魔法字节,跳过
+                            data = rb.ToArray();
+                        }
+                        if (data == null || data.Length == 0) continue;
+                        var name = $"{Guid.NewGuid():N}{ext}";
+                        try
+                        {
+                            File.WriteAllBytes(System.IO.Path.Combine(assetDir, name), data);
+                            sb.Append($"<img src=\"{LocalFileUrl(System.IO.Path.Combine(assetDir, name))}\"/>\n\n");
+                        }
+                        catch { /* 跳过坏图 */ }
+                    }
+                }
+                catch { /* 某页抽图失败不影响整篇 */ }
+            }
+        }
+        catch { /* PDF 解析失败返回已抽到的内容(可能为空) */ }
+        return sb.ToString();
+    }
+
+    // 本地绝对路径 -> file:// URL(正确转义空格/中文)。HtmlToMarkdown 原样保留绝对
+    // URL,ImageSixel.FetchImageBytes 再用 Uri.LocalPath 读回本地字节。
+    static string LocalFileUrl(string absPath) => new Uri(absPath).AbsoluteUri;
+
+    // ZIP 内相对路径解析(处理 ./ 与 ../),返回规范化的 ZIP entry 路径。
+    static string ResolveZipPath(string baseDir, string rel)
+    {
+        var stack = new List<string>();
+        foreach (var p in (baseDir + "/" + rel).Split('/'))
+        {
+            if (p == "" || p == ".") continue;
+            if (p == "..") { if (stack.Count > 0) stack.RemoveAt(stack.Count - 1); }
+            else stack.Add(p);
+        }
+        return string.Join("/", stack);
+    }
+
+    // EPUB 导入:保留语义 + 图片,去掉排版。
+    // 解 ZIP 按 OPF spine 顺序取 XHTML,抽 <img> 引用的图片存到 assetDir,
+    // 改写 src 为 file://;删 style/class 等表现层属性,body 内容交 HtmlToMarkdown 转 Markdown。
+    static string ReadEpubFile(string path, string assetDir)
+    {
+        using var zip = System.IO.Compression.ZipFile.OpenRead(path);
+        IEnumerable<string> htmlEntries;
+        var opf = zip.Entries.FirstOrDefault(e => e.FullName.EndsWith(".opf", StringComparison.OrdinalIgnoreCase));
+        if (opf != null)
+        {
+            string opfXml;
+            using (var s = opf.Open()) using (var r = new StreamReader(s)) opfXml = r.ReadToEnd();
+            var manifest = new Dictionary<string, string>();
+            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(opfXml, @"<item\b[^>]*\bid=""([^""]+)""[^>]*\bhref=""([^""]+)""", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                manifest[m.Groups[1].Value] = m.Groups[2].Value;
+            var order = new List<string>();
+            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(opfXml, @"<itemref\b[^>]*\bidref=""([^""]+)""", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                if (manifest.TryGetValue(m.Groups[1].Value, out var href)) order.Add(href);
+            var opfDir = Path.GetDirectoryName(opf.FullName)!.Replace('\\', '/');
+            htmlEntries = order.Select(h => ResolveZipPath(opfDir, h))
+                .Select(p => zip.Entries.FirstOrDefault(e => e.FullName.Equals(p, StringComparison.OrdinalIgnoreCase))?.FullName)
+                .Where(p => p != null).Select(p => p!)!;
         }
         else
         {
-            if (cur.Length > 10) readable.Append(cur);
-            cur.Clear();
+            htmlEntries = zip.Entries
+                .Where(e => e.FullName.EndsWith(".xhtml", StringComparison.OrdinalIgnoreCase)
+                         || e.FullName.EndsWith(".html", StringComparison.OrdinalIgnoreCase)
+                         || e.FullName.EndsWith(".htm", StringComparison.OrdinalIgnoreCase))
+                .Select(e => e.FullName).ToList();
         }
-    }
-    if (cur.Length > 10) readable.Append(cur);
-    return readable.ToString();
-}
 
-// 简易 EPUB 文本提取（ZIP → XHTML → 去标签）
-static string ReadEpubFile(string path)
-{
-    using var zip = System.IO.Compression.ZipFile.OpenRead(path);
-    var text = new System.Text.StringBuilder();
-    foreach (var entry in zip.Entries)
-    {
-        if (entry.FullName.EndsWith(".xhtml", StringComparison.OrdinalIgnoreCase) ||
-            entry.FullName.EndsWith(".html", StringComparison.OrdinalIgnoreCase) ||
-            entry.FullName.EndsWith(".htm", StringComparison.OrdinalIgnoreCase))
+        var sb = new System.Text.StringBuilder();
+        foreach (var full in htmlEntries)
         {
-            using var stream = entry.Open();
-            using var reader = new StreamReader(stream);
-            var html = reader.ReadToEnd();
-            // 简单去标签
-            var clean = System.Text.RegularExpressions.Regex.Replace(html, "<[^>]+>", " ");
-            clean = System.Text.RegularExpressions.Regex.Replace(clean, @"\s+", " ").Trim();
-            if (clean.Length > 0)
-            {
-                text.AppendLine(clean);
-                text.AppendLine();
-            }
+            var entry = zip.GetEntry(full);
+            if (entry == null) continue;
+            string html;
+            using (var s = entry.Open()) using (var r = new StreamReader(s)) html = r.ReadToEnd();
+            sb.Append(ExtractEpubHtml(html, zip, Path.GetDirectoryName(full)!.Replace('\\', '/'), assetDir));
+            sb.Append("\n\n");
         }
+        return sb.ToString();
     }
-    return text.ToString();
-}
 
-// 简易 DOCX 文本提取（ZIP → word/document.xml → 去标签）
-static string ReadDocxFile(string path)
-{
-    using var zip = System.IO.Compression.ZipFile.OpenRead(path);
-    var docEntry = zip.GetEntry("word/document.xml");
-    if (docEntry == null) return "";
-    using var stream = docEntry.Open();
-    using var reader = new StreamReader(stream);
-    var xml = reader.ReadToEnd();
-    var clean = System.Text.RegularExpressions.Regex.Replace(xml, "<[^>]+>", " ");
-    clean = System.Text.RegularExpressions.Regex.Replace(clean, @"\s+", " ").Trim();
-    return clean;
-}
-
-static string ReadImportedFile(string path)
-{
-    var ext = Path.GetExtension(path).ToLowerInvariant();
-    return ext switch
+    // 抽 EPUB 单篇 XHTML 的图片并改写为 file://,去掉表现层属性,返回 body 的 HTML。
+    static string ExtractEpubHtml(string html, System.IO.Compression.ZipArchive zip, string xhtmlDir, string assetDir)
     {
-        ".txt" or ".md" or ".markdown" => ReadTextFile(path),
-        ".pdf" => ReadPdfFile(path),
-        ".epub" => ReadEpubFile(path),
-        ".docx" => ReadDocxFile(path),
-        _ => throw new NotSupportedException($"Unsupported file type: {ext}")
-    };
-}
+        var doc = new HtmlAgilityPack.HtmlDocument();
+        doc.LoadHtml(html);
+        foreach (var img in (doc.DocumentNode.SelectNodes("//img[@src]") ?? Enumerable.Empty<HtmlAgilityPack.HtmlNode>()).ToList())
+        {
+            var src = img.GetAttributeValue("src", "");
+            if (string.IsNullOrWhiteSpace(src)) continue;
+            var rel = ResolveZipPath(xhtmlDir, src.TrimStart('/'));
+            var entry = zip.GetEntry(rel) ?? zip.GetEntry(rel.TrimStart('/'));
+            if (entry == null) continue;
+            var ext = Path.GetExtension(rel); if (string.IsNullOrEmpty(ext)) ext = ".png";
+            var name = $"{Guid.NewGuid():N}{ext}";
+            try
+            {
+                using var es = entry.Open(); using var ms = new MemoryStream(); es.CopyTo(ms);
+                File.WriteAllBytes(Path.Combine(assetDir, name), ms.ToArray());
+                img.SetAttributeValue("src", LocalFileUrl(Path.Combine(assetDir, name)));
+                img.Attributes.Remove("style"); img.Attributes.Remove("class"); img.Attributes.Remove("alt");
+            }
+            catch { /* 抽图失败就保留原 src(多半渲染不出来,但不崩) */ }
+        }
+        foreach (var n in (doc.DocumentNode.SelectNodes("//*[@style]") ?? Enumerable.Empty<HtmlAgilityPack.HtmlNode>()).ToList()) n.Attributes.Remove("style");
+        foreach (var n in (doc.DocumentNode.SelectNodes("//*[@class]") ?? Enumerable.Empty<HtmlAgilityPack.HtmlNode>()).ToList()) n.Attributes.Remove("class");
+        var body = doc.DocumentNode.SelectSingleNode("//body") ?? doc.DocumentNode;
+        return body.InnerHtml;
+    }
+
+    // DOCX 导入:抽 word/media 图片,把 <a:blip r:embed> 换成 <img src=file://>,
+    // 其余标签去干净(保留 <img>),交 HtmlToMarkdown。
+    static string ReadDocxFile(string path, string assetDir)
+    {
+        using var zip = System.IO.Compression.ZipFile.OpenRead(path);
+        var docEntry = zip.GetEntry("word/document.xml");
+        if (docEntry == null) return "";
+        string xml;
+        using (var s = docEntry.Open()) using (var r = new StreamReader(s)) xml = r.ReadToEnd();
+
+        var rels = new Dictionary<string, string>();
+        var relsEntry = zip.GetEntry("word/_rels/document.xml.rels");
+        if (relsEntry != null)
+        {
+            string relsXml;
+            using (var s = relsEntry.Open()) using (var r = new StreamReader(s)) relsXml = r.ReadToEnd();
+            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(relsXml, @"<Relationship\b[^>]*\bId=""([^""]+)""[^>]*\bTarget=""([^""]+)""", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                rels[m.Groups[1].Value] = m.Groups[2].Value;
+        }
+
+        string MediaUrl(string rId)
+        {
+            if (!rels.TryGetValue(rId, out var target)) return "";
+            var mediaRel = target.StartsWith("/") ? target.TrimStart('/') : "word/" + target;
+            var entry = zip.GetEntry(mediaRel);
+            if (entry == null) return "";
+            var ext = Path.GetExtension(mediaRel); if (string.IsNullOrEmpty(ext)) ext = ".png";
+            var name = $"{Guid.NewGuid():N}{ext}";
+            try { using var es = entry.Open(); using var ms = new MemoryStream(); es.CopyTo(ms); File.WriteAllBytes(Path.Combine(assetDir, name), ms.ToArray()); return LocalFileUrl(Path.Combine(assetDir, name)); }
+            catch { return ""; }
+        }
+
+        xml = System.Text.RegularExpressions.Regex.Replace(xml, @"<a:blip\b[^>]*\br:embed=""([^""]+)""[^>]*/?>", m =>
+        {
+            var url = MediaUrl(m.Groups[1].Value);
+            return url == "" ? "" : $"<img src=\"{url}\"/>";
+        }, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        // 去标签但保留 <img>
+        var clean = System.Text.RegularExpressions.Regex.Replace(xml, @"<(?!img\b)[^>]+>", " ");
+        clean = System.Text.RegularExpressions.Regex.Replace(clean, @"\s+", " ").Trim();
+        return clean;
+    }
+
+    static string ReadImportedFile(string path, string assetDir)
+    {
+        var ext = Path.GetExtension(path).ToLowerInvariant();
+        return ext switch
+        {
+            ".txt" or ".md" or ".markdown" => ReadTextFile(path),
+            ".pdf" => ReadPdfFile(path, assetDir),
+            ".epub" => ReadEpubFile(path, assetDir),
+            ".docx" => ReadDocxFile(path, assetDir),
+            _ => throw new NotSupportedException($"Unsupported file type: {ext}")
+        };
+    }
 
 // CLI: sip --import <file> [--title <name>] [--json]
 static void ImportCli(string[] args, string dbPath)
@@ -826,7 +902,12 @@ static void ImportCli(string[] args, string dbPath)
 
     try
     {
-        string content = ReadImportedFile(filePath);
+        // 图片落地目录:imported/assets/<guid>/。EPUB/DOCX/PDF 抽出的图写这里,
+        // <img src> 改写为 file:// 绝对路径,显示层 FetchImageBytes 直接读本地字节。
+        string importAssetsGuid = $"{Guid.NewGuid():N}";
+        string assetDir = Path.Combine(ImportedDir(), "assets", importAssetsGuid);
+        Directory.CreateDirectory(assetDir);
+        string content = ReadImportedFile(filePath, assetDir);
         if (string.IsNullOrWhiteSpace(content))
         {
             ReportError("EMPTY_FILE", Lang.T("File is empty or text could not be extracted: {0}", filePath), json: json);
