@@ -1,5 +1,5 @@
 ﻿// ===== Sumenia（苏暖泉）遥测服务 =====
-// 独立于主程序 RssReader.cs 的遥测子系统；与 RssReader.cs 同为全局命名空间（无 namespace）。
+// 独立于主程序 sipcore.cs 的遥测子系统；与 sipcore.cs 同为全局命名空间（无 namespace）。
 using System;
 using System.Collections.Generic;
 using System.IO;

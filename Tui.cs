@@ -1,6 +1,6 @@
-// ===== TUI 应用层:从 RssReader.cs 拆出的 TUI 专属代码(纯搬移,逻辑未改)=====
-// 与 RssReader.cs 同属 partial class Program(顶层语句入口文件生成的类),
-// 因此可自由调用 RssReader.cs 中的顶层函数(同类 private static 成员),
+// ===== TUI 应用层:从 sipcore.cs 拆出的 TUI 专属代码(纯搬移,逻辑未改)=====
+// 与 sipcore.cs 同属 partial class Program(顶层语句入口文件生成的类),
+// 因此可自由调用 sipcore.cs 中的顶层函数(同类 private static 成员),
 // 反之亦然。partial 类无法访问入口文件的 Main 局部变量(dataDir 等),
 // 所以这些 TUI 函数一律通过 dbPath 参数拿数据目录 —— 拆出前已是如此。
 using System;
@@ -173,6 +173,10 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
         // 开始界面：回车进入 / Q 退出
         if (showStartScreen && !ShowStartScreen(dbPath)) return 0;
         EnsureTelemetryConsentTui();   // 首次询问遥测（默认保持关闭）
+
+        // TUI 里给图片预留垂直空间。BuildArticleMarkdown 同时供 CLI 导出使用,
+        // 那边不能加零宽空格,所以用开关区分而不是写死在生成逻辑里。
+        TuiMdState.ReserveImageSpace = true;
 
         // —— 左侧：订阅源 + 文章 侧栏（文章标题自动换行显示）——
         // 侧栏为自绘 View：来源可展开/折叠，标题过长时自动换行（CJK 宽度感知）
@@ -518,12 +522,14 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
             if (n.ItemId != _currentArticleId)
             {
                 TelemetryCloseArticle();               // 主动切换 → 低进度记 skip
+                _lastBaseUrl = GetArticleLink(n.ItemId, dbPath);
                 contentView.Text = BuildArticleMarkdown(n.ItemId, contentMode, dbPath, contentView.GetContentWidth(), showFetchHint: true);
                 _currentArticleId = n.ItemId;
                 TelemetryOpenArticle(n.ItemId, n.FeedId);   // article_open + 计时初始化
             }
             else
             {
+                _lastBaseUrl = GetArticleLink(n.ItemId, dbPath);
                 contentView.Text = BuildArticleMarkdown(n.ItemId, contentMode, dbPath, contentView.GetContentWidth(), showFetchHint: true);
             }
             // 检测到历史进度 → 提示（不自动跳，等用户按 Space）；非法值直接忽略
@@ -1353,6 +1359,24 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
                     if (string.IsNullOrWhiteSpace(arg)) { Ask(Lang.T("Usage: import-opml <file.opml>"), Lang.T("OK")); return; }
                     RunCliCommandInTui(() => ImportOpmlCli(arg, dbPath));
                     return;
+                case "import" or "--import":
+                    if (string.IsNullOrWhiteSpace(arg))
+                    {
+                        // 无参数时弹对话框让用户输入路径
+                        ImportFileDialog(dbPath);
+                        RebuildTree();
+                    }
+                    else
+                    {
+                        RunCliCommandInTui(() => ImportCli(new[] { arg, "--json" }, dbPath));
+                        RebuildTree();
+                    }
+                    return;
+                case "import-rm" or "--import-rm":
+                    if (string.IsNullOrWhiteSpace(arg)) { Ask(Lang.T("Usage: import-rm <id>"), Lang.T("OK")); return; }
+                    RunCliCommandInTui(() => ImportRmCli(new[] { arg, "--yes" }, dbPath));
+                    RebuildTree();
+                    return;
                 case "feed-info" or "--feed-info":
                     RunCliCommandInTui(() => FeedInfoCli(string.IsNullOrEmpty(arg) ? new string[] { "" } : arg.Split(' '), dbPath));
                     return;
@@ -2150,6 +2174,56 @@ static void AddFeedManagerDialog(string dbPath)
     });
 }
 
+// 管理页：导入本地文件对话框
+#pragma warning disable CS0618
+static void ImportFileDialog(string dbPath)
+{
+    var dlg = new Dialog { Title = " " + Lang.T("Import file") + " " };
+    var lbl = new Label { Text = Lang.T("File path: "), X = 0, Y = 0 };
+    var input = new TextField { X = 0, Y = 1, Width = Dim.Fill(2), Text = "" };
+    var hint = new Label { Text = Lang.T("Supported: txt, md, pdf, epub, docx"), X = 0, Y = 2, Width = Dim.Fill() };
+    var ok = new Button { Text = Lang.T("OK"), IsDefault = true, X = 0, Y = 4 };
+    var cancel = new Button { Text = Lang.T("Cancel"), X = Pos.Right(ok) + 1, Y = 4 };
+    dlg.Add(lbl, input, hint, ok, cancel);
+    dlg.Width = 60; dlg.Height = 8;
+    ok.Accepted += (s, e) => dlg.RequestStop();
+    cancel.Accepted += (s, e) => { input.Text = ""; dlg.RequestStop(); };
+    Application.Run(dlg);
+    string path = input.Text.Trim();
+    if (string.IsNullOrWhiteSpace(path)) return;
+    // 去掉首尾引号（用户可能从资源管理器复制路径带引号）
+    path = path.Trim('"', '\'');
+    if (!File.Exists(path))
+    {
+        MessageBox.Query(Application.Instance, Lang.T("Error"), Lang.T("File not found: {0}", path), Lang.T("OK"));
+        return;
+    }
+    try
+    {
+        // 调用 CLI 导入逻辑
+        var args = new[] { "--import", path, "--json" };
+        var orig = Console.Out;
+        var sb = new StringBuilder();
+        using (var sw = new StringWriter(sb)) { Console.SetOut(sw); ImportCli(args, dbPath); }
+        Console.SetOut(orig);
+        var result = sb.ToString().Trim();
+        // 提取标题
+        string title = Path.GetFileNameWithoutExtension(path);
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(result);
+            if (doc.RootElement.TryGetProperty("title", out var t)) title = t.GetString() ?? title;
+        }
+        catch { }
+        MessageBox.Query(Application.Instance, Lang.T("Imported"), Lang.T("Imported: {0}", title), Lang.T("OK"));
+    }
+    catch (Exception ex)
+    {
+        MessageBox.Query(Application.Instance, Lang.T("Error"), ex.Message, Lang.T("OK"));
+    }
+}
+#pragma warning restore CS0618
+
 // 全文缓存自动清理：超过阈值时按最旧先删（保留 --purge-fulltext 手动清）
 
 static List<string> TodayStartScreenLines(string dbPath)
@@ -2266,13 +2340,23 @@ static bool ShowStartScreen(string dbPath)
 #pragma warning restore CS0618
 
 // 统一配置的 Markdown 阅读视图（配色 + 软换行当硬换行 + 删除线）
-static Markdown CreateMarkdownView()
+//
+// 返回 SipMarkdown 而不是 Markdown:子类会在每帧绘制结束后改写图片的 sixel
+// 落点,把它们水平居中。基类把图片锚在占位文本 "[alt]" 的首字符位置(即段落
+// 左对齐起点),私有方法没法 override,只能这样迂回。详见 SipMarkdown.cs。
+static SipMarkdown CreateMarkdownView()
 {
-    var v = new Markdown
+    var v = new SipMarkdown
     {
         ShowHeadingPrefix = false,
         UseThemeBackground = true,
-        EnableSixelImages = false,   // 图片已转链接，关闭 Sixel 管线避免重绘卡顿
+        // 能否出图取决于两件事，缺一不可：
+        //   1. 终端本身支持 sixel；
+        //   2. 终端自带的 ConPTY 组件（conpty.dll + OpenConsole.exe）版本够新。
+        // ConPTY 是真实的 conhost 实例而不是透传管道，不认识的 DCS(sixel) 序列会被
+        // 直接吞掉。Windows Terminal 自带的 OpenConsole 没问题；WezTerm 需要升级它
+        // 自带的那对组件到 1.22+，见 tools/upgrade-wezterm-conpty.ps1。
+        EnableSixelImages = true,
         ImageLoader = MarkdownImageLoader
     };
     // 阅读配色：正文亮白、代码绿色、强调亮黄、链接亮青
@@ -2356,23 +2440,12 @@ static IEnumerable<TuiNode> LoadArticleNodes(int feedId, string dbPath, int limi
 }
 
 
-// 从 URL 加载图片字节供 Markdown 渲染（带简单内存缓存，失败返回 null）
-static byte[]? MarkdownImageLoader(string url)
-{
-    try
-    {
-        if (TuiImageCache.Map.TryGetValue(url, out var cached)) return cached;
-        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
-        var bytes = client.GetByteArrayAsync(url).GetAwaiter().GetResult();
-        if (bytes.Length == 0) return null;
-        TuiImageCache.Map[url] = bytes;
-        return bytes;
-    }
-    catch
-    {
-        return null;
-    }
-}
+// Markdown 图片回调。注意这里必须返回**已编码的 sixel 字节**，不是原始图片字节 ——
+// Terminal.Gui 的 ImageLoader 契约就是如此，直接把 PNG/JPEG 喂进去不会出图。
+// 实现见 ImageSixel.cs。
+static byte[]? MarkdownImageLoader(string url) => LoadImageAsSixel(url, _lastBaseUrl);
+
+static string _lastBaseUrl = "";
 
 // HTML 正文转 Markdown（保留标题/粗体/斜体/删除线/分隔线/列表/代码/图片，供 TUI Markdown 渲染）
 
@@ -2635,9 +2708,10 @@ class SidebarView : View
                 _sel = i;
                 OnSelectionChanged();
                 EnsureSelectedVisible();
-                return true;
-            }
-        }
+        return true;
+    }
+}
+
         return false;
     }
 

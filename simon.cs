@@ -1,6 +1,6 @@
-// ===== 孟思琳(simon)——安全守护与数据加密(从 RssReader.cs 拆出)=====
-// 与 RssReader.cs 同属 partial class Program(入口文件顶层语句生成的类),
-// 可自由调用 RssReader.cs 的顶层函数与基础设施;入口的 RunCli 经
+// ===== 孟思琳(simon)——安全守护与数据加密(从 sipcore.cs 拆出)=====
+// 与 sipcore.cs 同属 partial class Program(入口文件顶层语句生成的类),
+// 可自由调用 sipcore.cs 的顶层函数与基础设施;入口的 RunCli 经
 // SimonCheckBlock/SimonCli 与此文件交互。
 using System;
 using System.Collections.Generic;

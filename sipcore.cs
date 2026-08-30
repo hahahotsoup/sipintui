@@ -621,6 +621,358 @@ static void PurgeFulltextCli(string arg, string dbPath)
     Console.WriteLine(Lang.T("Cleared cache for article {0}", itemId));
 }
 
+// ══════════ 本地文件导入（--import）：支持 txt/md/pdf/epub/docx ══════════
+// 导入的文件存 dataDir/imported/；数据库中用特殊 feed "本地导入" 归类
+static string ImportedDir() { string d = Path.Combine(dataDir, "imported"); Directory.CreateDirectory(d); return d; }
+
+static long GetOrCreateImportFeed(string dbPath)
+{
+    using var conn = OpenDb(dbPath);
+    conn.Open();
+    var cmd = conn.CreateCommand();
+    cmd.CommandText = "SELECT Id FROM Feeds WHERE FeedUrl = 'local://import'";
+    var r = cmd.ExecuteScalar();
+    if (r != null) return (long)r;
+
+    cmd.CommandText = @"
+        INSERT INTO Feeds (Title, FeedUrl, Link, Description, LastFetched, RawXml)
+        VALUES ('本地导入', 'local://import', '', '本地导入的文件（PDF/EPUB/DOCX/TXT/MD）', @now, '')
+    ";
+    cmd.Parameters.AddWithValue("@now", DateTime.Now.ToString("O"));
+    cmd.ExecuteNonQuery();
+    cmd.CommandText = "SELECT last_insert_rowid()";
+    return (long)cmd.ExecuteScalar()!;
+}
+
+// 纯文本读取（txt/md）
+static string ReadTextFile(string path)
+{
+    return File.ReadAllText(path);
+}
+
+// 简易 PDF 文本提取（基于文本流解析，非完整 PDF 解析器）
+static string ReadPdfFile(string path)
+{
+    var bytes = File.ReadAllBytes(path);
+    var text = new System.Text.StringBuilder();
+    // 尝试提取 BT/ET 文本块（PDF 内嵌文本）
+    var content = System.Text.Encoding.Latin1.GetString(bytes);
+    int idx = 0;
+    while (idx < content.Length)
+    {
+        int btStart = content.IndexOf("BT", idx);
+        if (btStart < 0) break;
+        int etEnd = content.IndexOf("ET", btStart + 2);
+        if (etEnd < 0) break;
+        var block = content[(btStart + 2)..etEnd];
+        // 提取 Tj/TJ 操作符中的文本
+        int pos = 0;
+        while (pos < block.Length)
+        {
+            int tj = block.IndexOf("Tj", pos);
+            int tjArr = block.IndexOf("TJ", pos);
+            int next = -1;
+            string? val = null;
+            if (tj >= 0 && (tjArr < 0 || tj < tjArr))
+            {
+                // (string)Tj
+                int parenStart = block.LastIndexOf('(', tj);
+                int parenEnd = block.IndexOf(')', tj);
+                if (parenStart >= 0 && parenEnd > parenStart)
+                    val = block[(parenStart + 1)..parenEnd];
+                next = tj + 2;
+            }
+            else if (tjArr >= 0)
+            {
+                // [array]TJ
+                int bracketStart = block.LastIndexOf('[', tjArr);
+                int bracketEnd = block.IndexOf(']', tjArr);
+                if (bracketStart >= 0 && bracketEnd > bracketStart)
+                {
+                    var arr = block[(bracketStart + 1)..bracketEnd];
+                    // 提取每个 (string) 元素
+                    var strParts = new List<string>();
+                    int si = 0;
+                    while (si < arr.Length)
+                    {
+                        int ps = arr.IndexOf('(', si);
+                        if (ps < 0) break;
+                        int pe = arr.IndexOf(')', ps);
+                        if (pe < 0) break;
+                        strParts.Add(arr[(ps + 1)..pe]);
+                        si = pe + 1;
+                    }
+                    val = string.Join("", strParts);
+                }
+                next = tjArr + 2;
+            }
+            if (val != null)
+            {
+                // 解码 PDF 转义
+                val = val.Replace("\\n", "\n").Replace("\\r", "\r").Replace("\\t", "\t")
+                         .Replace("\\(", "(").Replace("\\)", ")").Replace("\\\\", "\\");
+                text.Append(val);
+            }
+            pos = next > pos ? next : pos + 1;
+        }
+        idx = etEnd + 2;
+    }
+    if (text.Length > 0) return text.ToString();
+    // 回退：提取可读文本（连续 printable 字符 > 10）
+    var readable = new System.Text.StringBuilder();
+    var cur = new System.Text.StringBuilder();
+    for (int i = 0; i < bytes.Length; i++)
+    {
+        byte b = bytes[i];
+        if (b >= 32 && b < 127 || b == 10 || b == 13 || b >= 192)
+        {
+            cur.Append((char)b);
+        }
+        else
+        {
+            if (cur.Length > 10) readable.Append(cur);
+            cur.Clear();
+        }
+    }
+    if (cur.Length > 10) readable.Append(cur);
+    return readable.ToString();
+}
+
+// 简易 EPUB 文本提取（ZIP → XHTML → 去标签）
+static string ReadEpubFile(string path)
+{
+    using var zip = System.IO.Compression.ZipFile.OpenRead(path);
+    var text = new System.Text.StringBuilder();
+    foreach (var entry in zip.Entries)
+    {
+        if (entry.FullName.EndsWith(".xhtml", StringComparison.OrdinalIgnoreCase) ||
+            entry.FullName.EndsWith(".html", StringComparison.OrdinalIgnoreCase) ||
+            entry.FullName.EndsWith(".htm", StringComparison.OrdinalIgnoreCase))
+        {
+            using var stream = entry.Open();
+            using var reader = new StreamReader(stream);
+            var html = reader.ReadToEnd();
+            // 简单去标签
+            var clean = System.Text.RegularExpressions.Regex.Replace(html, "<[^>]+>", " ");
+            clean = System.Text.RegularExpressions.Regex.Replace(clean, @"\s+", " ").Trim();
+            if (clean.Length > 0)
+            {
+                text.AppendLine(clean);
+                text.AppendLine();
+            }
+        }
+    }
+    return text.ToString();
+}
+
+// 简易 DOCX 文本提取（ZIP → word/document.xml → 去标签）
+static string ReadDocxFile(string path)
+{
+    using var zip = System.IO.Compression.ZipFile.OpenRead(path);
+    var docEntry = zip.GetEntry("word/document.xml");
+    if (docEntry == null) return "";
+    using var stream = docEntry.Open();
+    using var reader = new StreamReader(stream);
+    var xml = reader.ReadToEnd();
+    var clean = System.Text.RegularExpressions.Regex.Replace(xml, "<[^>]+>", " ");
+    clean = System.Text.RegularExpressions.Regex.Replace(clean, @"\s+", " ").Trim();
+    return clean;
+}
+
+static string ReadImportedFile(string path)
+{
+    var ext = Path.GetExtension(path).ToLowerInvariant();
+    return ext switch
+    {
+        ".txt" or ".md" or ".markdown" => ReadTextFile(path),
+        ".pdf" => ReadPdfFile(path),
+        ".epub" => ReadEpubFile(path),
+        ".docx" => ReadDocxFile(path),
+        _ => throw new NotSupportedException($"Unsupported file type: {ext}")
+    };
+}
+
+// CLI: sip --import <file> [--title <name>] [--json]
+static void ImportCli(string[] args, string dbPath)
+{
+    bool json = args.Any(a => a.Equals("--json", StringComparison.OrdinalIgnoreCase));
+    string? filePath = null;
+    string? title = null;
+    for (int i = 0; i < args.Length; i++)
+    {
+        if (args[i] == "--title" && i + 1 < args.Length) title = args[++i];
+        else if (!args[i].StartsWith("-")) filePath = args[i];
+    }
+
+    if (string.IsNullOrEmpty(filePath))
+    {
+        SetExit(); Console.WriteLine(Lang.T("Usage: sip --import <file> [--title <name>] [--json]"));
+        return;
+    }
+
+    if (!File.Exists(filePath))
+    {
+        ReportError("FILE_NOT_FOUND", Lang.T("File not found: {0}", filePath), json: json);
+        return;
+    }
+
+    var ext = Path.GetExtension(filePath).ToLowerInvariant();
+    if (ext is not (".txt" or ".md" or ".markdown" or ".pdf" or ".epub" or ".docx"))
+    {
+        ReportError("UNSUPPORTED_FORMAT", Lang.T("Unsupported file type: {0}. Supported: txt, md, pdf, epub, docx", ext), json: json);
+        return;
+    }
+
+    try
+    {
+        string content = ReadImportedFile(filePath);
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            ReportError("EMPTY_FILE", Lang.T("File is empty or text could not be extracted: {0}", filePath), json: json);
+            return;
+        }
+
+        string fileName = Path.GetFileNameWithoutExtension(filePath);
+        string importedTitle = title ?? fileName;
+        string guid = $"import:{Guid.NewGuid():N}";
+
+        // 复制文件到 imported/
+        string importDir = ImportedDir();
+        string destName = $"{DateTime.Now:yyyyMMdd_HHmmss}_{Path.GetFileName(filePath)}";
+        string destPath = Path.Combine(importDir, destName);
+        File.Copy(filePath, destPath, true);
+
+        long feedId = GetOrCreateImportFeed(dbPath);
+
+        using var conn = OpenDb(dbPath);
+        conn.Open();
+        using var tx = conn.BeginTransaction();
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = @"
+            INSERT INTO Items (FeedId, Title, Link, Description, Author, PublishDate, Content, Guid, Status, Version)
+            VALUES (@feedId, @title, @link, @desc, @author, @pubdate, @content, @guid, 'active', 1)
+        ";
+        cmd.Parameters.AddWithValue("@feedId", feedId);
+        cmd.Parameters.AddWithValue("@title", importedTitle);
+        cmd.Parameters.AddWithValue("@link", destPath);
+        cmd.Parameters.AddWithValue("@desc", $"本地导入 · {ext[1..].ToUpper()} · {content.Length} 字");
+        cmd.Parameters.AddWithValue("@author", "本地导入");
+        cmd.Parameters.AddWithValue("@pubdate", DateTime.Now.ToString("O"));
+        cmd.Parameters.AddWithValue("@content", content);
+        cmd.Parameters.AddWithValue("@guid", guid);
+        cmd.ExecuteNonQuery();
+
+        cmd.CommandText = "SELECT last_insert_rowid()";
+        long itemId = (long)cmd.ExecuteScalar()!;
+
+        tx.Commit();
+
+        if (json)
+            JsonOut(new { success = true, id = itemId, title = importedTitle, file = destPath, feed = "本地导入" });
+        else
+            Console.WriteLine(Lang.T("Imported: {0} → #{1}", importedTitle, itemId));
+    }
+    catch (NotSupportedException ex)
+    {
+        ReportError("UNSUPPORTED_FORMAT", ex.Message, json: json);
+    }
+    catch (Exception ex)
+    {
+        ReportError("IMPORT_ERROR", ex.Message, json: json);
+    }
+}
+
+// CLI: sip --import-rm <id> [--yes] [--json]
+static void ImportRmCli(string[] args, string dbPath)
+{
+    bool json = args.Any(a => a.Equals("--json", StringComparison.OrdinalIgnoreCase));
+    bool yes = args.Any(a => a.Equals("--yes", StringComparison.OrdinalIgnoreCase) || a.Equals("-y", StringComparison.OrdinalIgnoreCase));
+    string? idStr = args.FirstOrDefault(a => !a.StartsWith("-") && !a.Equals("rm", StringComparison.OrdinalIgnoreCase));
+
+    if (string.IsNullOrEmpty(idStr) || !int.TryParse(idStr, out int displayId))
+    {
+        SetExit(); Console.WriteLine(Lang.T("Usage: sip --import-rm <id> [--yes] [--json]"));
+        return;
+    }
+
+    // 将显示编号转为真实 ItemId（仅在"本地导入"源内查找）
+    long realId = 0;
+    using (var conn = OpenDb(dbPath))
+    {
+        conn.Open();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = @"
+            SELECT Id FROM (
+                SELECT i.Id,
+                       ROW_NUMBER() OVER (ORDER BY i.Id) AS DisplayNum
+                FROM Items i
+                JOIN Feeds f ON i.FeedId = f.Id
+                WHERE f.FeedUrl = 'local://import'
+            ) WHERE DisplayNum = @n
+        ";
+        cmd.Parameters.AddWithValue("@n", displayId);
+        var r = cmd.ExecuteScalar();
+        if (r != null) realId = (long)r;
+    }
+
+    if (realId == 0) { ReportError("ITEM_NOT_FOUND", Lang.T("Article {0} not found", displayId), json: json); return; }
+
+    // 检查是否属于"本地导入"
+    using (var conn = OpenDb(dbPath))
+    {
+        conn.Open();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = @"
+            SELECT i.Id FROM Items i
+            JOIN Feeds f ON i.FeedId = f.Id
+            WHERE i.Id = @id AND f.FeedUrl = 'local://import'
+        ";
+        cmd.Parameters.AddWithValue("@id", realId);
+        if (cmd.ExecuteScalar() == null)
+        {
+            ReportError("NOT_IMPORTED", Lang.T("Article {0} is not an imported file", displayId), json: json);
+            return;
+        }
+    }
+
+    if (!yes)
+    {
+        Console.Write(Lang.T("Delete imported article {0}? [y/N] ", displayId));
+        var key = Console.ReadLine()?.Trim().ToLowerInvariant();
+        if (key != "y" && key != "yes") { Console.WriteLine(Lang.T("Cancelled")); return; }
+    }
+
+    // 获取文件路径并删除
+    using (var conn = OpenDb(dbPath))
+    {
+        conn.Open();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT Link FROM Items WHERE Id = @id";
+        cmd.Parameters.AddWithValue("@id", realId);
+        var link = cmd.ExecuteScalar()?.ToString();
+        if (!string.IsNullOrEmpty(link) && File.Exists(link))
+        {
+            try { File.Delete(link); } catch { }
+        }
+    }
+
+    // 删除数据库记录
+    using (var conn = OpenDb(dbPath))
+    {
+        conn.Open();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM Items WHERE Id = @id";
+        cmd.Parameters.AddWithValue("@id", realId);
+        cmd.ExecuteNonQuery();
+    }
+
+    if (json)
+        JsonOut(new { success = true, deleted = displayId });
+    else
+        Console.WriteLine(Lang.T("Deleted imported article {0}", displayId));
+}
+
 // ══════════ 阅读进度记忆（按文章记录滚动位置，文件存储，零改表）══════════
 static string ReadingProgressPath() => Path.Combine(dataDir, "reading_progress.json");
 
@@ -2719,6 +3071,14 @@ static async Task RunCli(string[] args, string dbPath)
         case "--summary":
             SummaryCli(args[1], dbPath, args.Any(a => a.Equals("--json", StringComparison.OrdinalIgnoreCase))).Wait();
             break;
+        case "--import":
+            if (args.Length < 2) { SetExit(); Console.WriteLine(Lang.T("Usage: sip --import <file> [--title <name>] [--json]")); return; }
+            ImportCli(args.Skip(1).ToArray(), dbPath);
+            break;
+        case "--import-rm":
+            if (args.Length < 2) { SetExit(); Console.WriteLine(Lang.T("Usage: sip --import-rm <id> [--yes] [--json]")); return; }
+            ImportRmCli(args.Skip(1).ToArray(), dbPath);
+            break;
         default:
             SetExit(); Console.WriteLine(Lang.T("Unknown command: {0}", cmd));
             PrintHelp();
@@ -2745,6 +3105,8 @@ static void PrintHelp()
     Console.WriteLine(Lang.T("  --purge-fulltext [id]  clear the full-text cache"));
     Console.WriteLine(Lang.T("  --feed-info <n>  source identity & health (type/author/site/updated/status; --json)"));
     Console.WriteLine(Lang.T("  --export-opml [file]  export feeds as OPML; --import-opml <file>  import feeds"));
+    Console.WriteLine(Lang.T("  --import <file> [--title <name>]  import local file (txt/md/pdf/epub/docx)"));
+    Console.WriteLine(Lang.T("  --import-rm <id> [--yes]  remove an imported file"));
     Console.WriteLine(Lang.T("  --like <id> [--ai [reason]]  mark an article (♥ user / 🤖 AI); --likes lists marks"));
     Console.WriteLine(Lang.T("  --today [--json]  today's curated reading list (rule-based; guides daily reading habit)"));
     Console.WriteLine(Lang.T("  telemetry status|show|enable|disable|clear|export  local reading telemetry · Sumenia (default OFF)"));
@@ -2769,7 +3131,7 @@ static void PrintHelp()
     Console.WriteLine(Lang.T("  --index          embed articles (interactive selection)"));
     Console.WriteLine(Lang.T("  --reindex        re-embed after changing the embedding model"));
     Console.WriteLine(Lang.T("  --search <query> [--feed number] [--threshold 0.7] [--json] semantic search (all feeds without --feed)"));
-    Console.WriteLine(Lang.T("  --grep <keyword>   full-text search (title/content/summary, no AI needed); outputs id+title+count and ±50-char snippets, bounded (--feed N / --limit N / --max-snippets N / --json / --full)"));
+    Console.WriteLine(Lang.T("  --grep <keyword>   full-text search (title/content/summary, no AI needed); outputs id+title+count+line and ±N-char snippets (--context N / --feed N / --limit N / --max-snippets N / --json / --full)"));
     Console.WriteLine(Lang.T("  --summary <id>   summarize one article; use feed:<number> for all articles of a feed (--json)"));
     Console.WriteLine(Lang.T("  --summary-all    summarize all articles without a summary"));
     Console.WriteLine();
@@ -2828,6 +3190,23 @@ static void TrimFulltextCache(int maxFiles = 200, long maxBytes = 200L * 1024 * 
     catch { /* 清理失败不影响主流程 */ }
 }
 
+// 获取文章的 Link URL（供 TUI 图片相对路径解析）
+static string GetArticleLink(long itemId, string dbPath)
+{
+    try
+    {
+        using var conn = OpenDb(dbPath);
+        conn.Open();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT Link FROM Items WHERE Id = @id";
+        cmd.Parameters.AddWithValue("@id", itemId);
+        var r = cmd.ExecuteReader();
+        if (r.Read() && !r.IsDBNull(0)) return r.GetString(0);
+    }
+    catch { }
+    return "";
+}
+
 // 起始页「今日哈汤」区块：规则清单 + 目标进度（引导习惯，不堆量）
 static string BuildArticleMarkdown(long itemId, bool contentMode, string dbPath, int wrapWidth, bool showFetchHint = false)
 {
@@ -2871,7 +3250,7 @@ static string BuildArticleMarkdown(long itemId, bool contentMode, string dbPath,
     {
         // 完整正文模式：Content（原文）在上，抓取全文在下（若有缓存），中间分界
         string body = string.IsNullOrWhiteSpace(content) ? desc : content;
-        md.Append(HtmlToMarkdown(body, wrapWidth));
+        md.Append(HtmlToMarkdown(body, wrapWidth, link));
         string? fulltext = ReadFulltextCache(itemId);
         if (!string.IsNullOrWhiteSpace(fulltext))
         {
@@ -2902,7 +3281,7 @@ static string BuildArticleMarkdown(long itemId, bool contentMode, string dbPath,
             md.AppendLine();
         }
         if (!string.IsNullOrWhiteSpace(desc))
-            md.Append(HtmlToMarkdown(desc, wrapWidth));
+            md.Append(HtmlToMarkdown(desc, wrapWidth, link));
         else
             md.Append(Lang.T("(No summary, press G for full content)"));
     }
@@ -2930,7 +3309,7 @@ static string CjkSpace(string s)
 // 每个 Guid（同一篇文章）只显示最新一版，不再堆「[现] v1」；若该文有被作者改过的旧版本，
 // 标题右侧加 ✎ 标记，选中后按 V 可查看全部版本 / 变更历史
 // 注意：Guid 为空串时（既无 Id 也无 Link 的文章）不做分组，避免把无关文章挤成一行
-static string HtmlToMarkdown(string html, int imageWidth = 80)
+static string HtmlToMarkdown(string html, int imageWidth = 80, string? baseUrl = null)
 {
     TuiMdState.Links.Clear();
     TuiMdState.ImageWidth = imageWidth;
@@ -2940,7 +3319,7 @@ static string HtmlToMarkdown(string html, int imageWidth = 80)
         var doc = new HtmlAgilityPack.HtmlDocument();
         doc.LoadHtml(html);
         var sb = new StringBuilder();
-        WalkHtml(doc.DocumentNode, sb, 0);
+        WalkHtml(doc.DocumentNode, sb, 0, baseUrl);
         var text = sb.ToString();
         text = Regex.Replace(text, @"[ \t]{2,}", " ");
         text = Regex.Replace(text, @"\n{3,}", "\n\n");
@@ -2953,7 +3332,7 @@ static string HtmlToMarkdown(string html, int imageWidth = 80)
     }
 }
 
-static void WalkHtml(HtmlAgilityPack.HtmlNode node, StringBuilder sb, int listDepth)
+static void WalkHtml(HtmlAgilityPack.HtmlNode node, StringBuilder sb, int listDepth, string? baseUrl = null)
 {
     if (node.NodeType == HtmlAgilityPack.HtmlNodeType.Text)
     {
@@ -2966,23 +3345,23 @@ static void WalkHtml(HtmlAgilityPack.HtmlNode node, StringBuilder sb, int listDe
         case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
             int level = name[1] - '0';
             sb.Append('\n').Append(new string('#', level)).Append(' ');
-            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth);
+            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth, baseUrl);
             sb.Append('\n');
             return;
         case "p":
             // 段落不做首行缩进（博客原文通常没有缩进，避免格式打架）
             sb.Append('\n');
-            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth);
+            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth, baseUrl);
             sb.Append("\n\n");
             return;
         case "div": case "section": case "article":
-            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth);
+            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth, baseUrl);
             sb.Append("\n\n");
             return;
         case "blockquote":
             // 引用块也不加缩进（与段落一致）
             sb.Append('\n');
-            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth);
+            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth, baseUrl);
             sb.Append("\n\n");
             return;
         case "br":
@@ -2995,22 +3374,22 @@ static void WalkHtml(HtmlAgilityPack.HtmlNode node, StringBuilder sb, int listDe
             return;
         case "strong": case "b":
             sb.Append("**");
-            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth);
+            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth, baseUrl);
             sb.Append("**");
             return;
         case "em": case "i":
             sb.Append('*');
-            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth);
+            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth, baseUrl);
             sb.Append('*');
             return;
         case "del": case "s": case "strike":
             sb.Append("~~");
-            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth);
+            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth, baseUrl);
             sb.Append("~~");
             return;
         case "u":
             sb.Append("__");
-            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth);
+            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth, baseUrl);
             sb.Append("__");
             return;
         case "code":
@@ -3022,47 +3401,88 @@ static void WalkHtml(HtmlAgilityPack.HtmlNode node, StringBuilder sb, int listDe
         case "a":
             string href = node.GetAttributeValue("href", "");
             var linkText = new StringBuilder();
-            foreach (var c in node.ChildNodes) WalkHtml(c, linkText, listDepth);
+            foreach (var c in node.ChildNodes) WalkHtml(c, linkText, listDepth, baseUrl);
             string ltxt = System.Net.WebUtility.HtmlDecode(linkText.ToString().Trim());
             if (!string.IsNullOrWhiteSpace(ltxt) && !string.IsNullOrWhiteSpace(href))
                 TuiMdState.Links.Add((ltxt, href));
             sb.Append('[').Append(linkText).Append(']').Append('(').Append(EscapeMdUrl(href)).Append(')');
             return;
         case "img":
-            string alt2 = node.GetAttributeValue("alt", "");
+            // alt 不再读取 —— 占位文本统一用 ZWSP(见下方 label 的注释)
             string src2 = node.GetAttributeValue("src", "");
             if (!string.IsNullOrWhiteSpace(src2))
             {
-                // Windows Terminal 等终端不支持 Sixel/kitty 内嵌图片，
-                // 统一转成可点击链接，用链接导航模式/Ctrl+O 或鼠标点击在浏览器打开
-                string label = string.IsNullOrWhiteSpace(alt2) ? Lang.T("Image") : alt2;
-                sb.Append('[').Append("🖼️ ").Append(label).Append(']').Append('(').Append(EscapeMdUrl(src2)).Append(')');
+                // 解析相对路径图片 URL
+                string imgUrl = src2;
+                if (!string.IsNullOrWhiteSpace(baseUrl) && !Uri.TryCreate(src2, UriKind.Absolute, out _))
+                {
+                    try { imgUrl = new Uri(new Uri(baseUrl), src2).AbsoluteUri; }
+                    catch { /* 保持原值 */ }
+                }
+                // 保留 Markdown 图片语法，由 TUI Markdown 渲染器处理（Sixel/Kitty/链接回退）
+                //
+                // alt 恒定为 ZWSP(U+200B),不管 TUI 还是 CLI 导出:
+                //   * Terminal.Gui 的 GetFallbackText 是私有的,没法让它返回空串。
+                //     给**空** alt 时它会兜底成 "[image]"(6 列可见) —— 反而更糟。
+                //   * ZWSP 不是空白字符(IsNullOrWhiteSpace 为 false),所以会走真实
+                //     分支返回 "[\u200B]" —— "[" + ZWSP + "]",其中 ZWSP 渲染宽度为 0,
+                //     "[" 和 "]" 各 1 列,**共 2 列可见** —— 这是能做到的最小占位。
+                //   * 原 HTML 的 alt 通常取自 src 文件名(实测见过占 32 列的
+                //     "[Image_1771682342796_915.webp]"),在这层直接丢弃。
+                //
+                // 取舍:TUI 里 sixel 会覆盖图片那一行,2 列占位基本看不见;CLI 导出
+                // 到不支持图片的阅读器时,那张图就只剩 2 列 "[]"。hotsoup 明确接受
+                // 这个后果("用户用老阅读器就当不知道图片行了")。
+                const string label = "\u200b";
+                sb.Append("\n\n![");
+                sb.Append(label);
+                sb.Append("](");
+                sb.Append(EscapeMdUrl(imgUrl));
+                sb.Append(")\n\n");
+
+                // 给图片在文档流里预留垂直空间。
+                //
+                // 原因:sixel 是以光标位置为原点向右下铺像素的,而它在 Markdown 文档流
+                // 里只占 1 行(占位文本 "[alt]" 那一行)。图片实际有十几到二十个单元高,
+                // 不预留的话,后面那几段正文会被图片整个压在底下看不见。
+                //
+                // 直接堆空行是没用的 —— CommonMark 会把连续空行折叠成一个段落间隔
+                // (实测 "AAA\n\n\n\n\n\n\nBBB" 和 "AAA\n\nBBB" 渲染结果一模一样)。
+                // 零宽空格不是空白字符,所以不会被当空行折叠,但渲染宽度为 0,看起来
+                // 还是空行。实测每个零宽空格段落产出 2 行(自身 + 段落间隔)。
+                //
+                // 只在 TUI 里加:这个函数同时供 CLI 导出用,命令行输出里塞零宽空格是垃圾。
+                if (TuiMdState.ReserveImageSpace)
+                {
+                    for (int i = 0; i < TuiMdState.ImageReservedBlankParagraphs; i++)
+                        sb.Append(TuiMdState.BlankLineFiller).Append("\n\n");
+                }
             }
             return;
         case "ul": case "ol":
-            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth + 1);
+            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth + 1, baseUrl);
             sb.Append('\n');
             return;
         case "li":
             sb.Append('\n').Append(new string(' ', listDepth * 2)).Append("- ");
-            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth);
+            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth, baseUrl);
             return;
         case "tr":
-            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth);
+            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth, baseUrl);
             sb.Append('\n');
             return;
         case "td": case "th":
-            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth);
+            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth, baseUrl);
             sb.Append(" | ");
             return;
         case "table":
-            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth);
+            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth, baseUrl);
             sb.Append('\n');
             return;
         case "script": case "style": case "head": case "nav": case "footer": case "aside":
             return;  // 丢弃
         default:
-            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth);
+            foreach (var c in node.ChildNodes) WalkHtml(c, sb, listDepth, baseUrl);
             return;
     }
 }
@@ -5437,12 +5857,13 @@ static void SearchCli(string[] args, string dbPath)
 // 全文搜索 CLI：在标题/正文/摘要里做关键字匹配（类似 VS Code 全文搜索，不依赖 AI）
 // 默认「片段模式」：每篇只出 编号 + 标题 + 出现次数 + 上下 50 字符的片段，输出有上限、不会爆上下文；
 // --full 恢复旧模式（整篇摘要），--json 结构化输出
+// --context <N>：自定义上下文字符数（默认 50）
 static void GrepCli(string[] args, string dbPath)
 {
     var flags = args.Skip(1).ToArray();
     bool json = flags.Contains("--json", StringComparer.OrdinalIgnoreCase);
     bool full = flags.Contains("--full", StringComparer.OrdinalIgnoreCase);
-    int limit = 20, maxSnippets = 10;
+    int limit = 20, maxSnippets = 10, context = 50;
     int? feedReal = null;
     for (int i = 0; i < flags.Length; i++)
     {
@@ -5450,6 +5871,8 @@ static void GrepCli(string[] args, string dbPath)
             limit = Math.Max(1, l);
         if (flags[i].Equals("--max-snippets", StringComparison.OrdinalIgnoreCase) && i + 1 < flags.Length && int.TryParse(flags[i + 1], out int ms))
             maxSnippets = Math.Max(1, ms);
+        if (flags[i].Equals("--context", StringComparison.OrdinalIgnoreCase) && i + 1 < flags.Length && int.TryParse(flags[i + 1], out int ctx))
+            context = Math.Max(0, ctx);
         // --feed N：限定单个源内搜索（与 --search --feed 同规则，N 为显示序号）
         if (flags[i].Equals("--feed", StringComparison.OrdinalIgnoreCase) && i + 1 < flags.Length && int.TryParse(flags[i + 1], out int fn))
         {
@@ -5500,17 +5923,17 @@ static void GrepCli(string[] args, string dbPath)
         return;
     }
 
-    // 片段模式：每篇统计出现次数 + 取前 maxSnippets 个 ±50 字符片段
+    // 片段模式：每篇统计出现次数 + 取前 maxSnippets 个 ±context 字符片段
     var items = new List<GrepSnippetResult>();
     foreach (var h in hits)
     {
         string haystack = h.Title + "\n" + StripHtml(string.IsNullOrWhiteSpace(h.Content) ? h.Description : h.Content)
                           + (string.IsNullOrWhiteSpace(h.Summary) ? "" : "\n" + h.Summary);
-        var (snippets, total) = ExtractGrepSnippets(haystack, keyword, radius: 50, max: maxSnippets);
+        var (snippets, total, lineNumbers) = ExtractGrepSnippets(haystack, keyword, radius: context, max: maxSnippets);
         items.Add(new GrepSnippetResult
         {
             ItemId = h.ItemId, Title = h.Title, Link = h.Link, FeedTitle = h.FeedTitle,
-            Count = total, Snippets = snippets, TotalSnippets = total,
+            Count = total, Snippets = snippets, LineNumbers = lineNumbers, TotalSnippets = total,
             Quality = ContentQuality(h.Content, h.Description)
         });
     }
@@ -5529,7 +5952,11 @@ static void GrepCli(string[] args, string dbPath)
                     title = r.Title,
                     count = r.Count,
                     totalSnippets = r.TotalSnippets,
-                    snippets = r.Snippets,
+                    snippets = r.Snippets.Select((s, i) => new
+                    {
+                        text = s,
+                        line = i < r.LineNumbers.Count ? r.LineNumbers[i] : 0
+                    }),
                     link = r.Link,
                     feedTitle = r.FeedTitle,
                     quality = r.Quality
@@ -5546,7 +5973,10 @@ static void GrepCli(string[] args, string dbPath)
         string note = r.Count == 0 ? "  " + Lang.T("(仅命中链接/属性，未计入可见文本)") : "";
         Console.WriteLine($"  [{r.ItemId}] {StripControlChars(r.Title)} ({Lang.T("{0} occurrences", r.Count)}){note}");
         for (int i = 0; i < r.Snippets.Count; i++)
-            Console.WriteLine($"    {i + 1}. {StripControlChars(r.Snippets[i])}");
+        {
+            int lineNum = i < r.LineNumbers.Count ? r.LineNumbers[i] : 0;
+            Console.WriteLine($"    {i + 1}. L{lineNum}: {StripControlChars(r.Snippets[i])}");
+        }
         if (r.TotalSnippets > r.Snippets.Count)
             Console.WriteLine(Lang.T("    …({0} more, view full text with sip --show {1})", r.TotalSnippets - r.Snippets.Count, r.ItemId));
     }
@@ -5555,18 +5985,21 @@ static void GrepCli(string[] args, string dbPath)
 // 在纯文本 haystack 里大小写不敏感地找出 keyword 的所有出现位置，
 // 每个位置取 [i-radius, i+radius+len] 的窗口；相邻窗口重叠时合并；
 // 只保留前 max 段（超出返回 total 让调用方知道还有多少）
-static (List<string> Snippets, int Total) ExtractGrepSnippets(string haystack, string keyword, int radius, int max)
+// 返回 (snippets, total, lineNumbers)：lineNumbers[i] = snippets[i] 所在行号
+static (List<string> Snippets, int Total, List<int> LineNumbers) ExtractGrepSnippets(string haystack, string keyword, int radius, int max)
 {
-    if (string.IsNullOrEmpty(haystack) || string.IsNullOrEmpty(keyword)) return (new List<string>(), 0);
+    if (string.IsNullOrEmpty(haystack) || string.IsNullOrEmpty(keyword)) return (new List<string>(), 0, new List<int>());
 
     int kwLen = keyword.Length;
     var ranges = new List<(int Start, int End)>();
+    var matchPositions = new List<int>(); // 每个匹配的起始位置
     int from = 0, total = 0;
     while (true)
     {
         int idx = haystack.IndexOf(keyword, from, StringComparison.OrdinalIgnoreCase);
         if (idx < 0) break;
         total++;
+        matchPositions.Add(idx);
 
         int start = Math.Max(0, idx - radius);
         int end = Math.Min(haystack.Length, idx + kwLen + radius);
@@ -5583,8 +6016,28 @@ static (List<string> Snippets, int Total) ExtractGrepSnippets(string haystack, s
         // 超过 max 后不再新增窗口，但继续统计总出现次数（total 是真实的全部次数）
         from = idx + kwLen;
     }
+
+    // 计算每个片段所在行号（以第一个匹配位置为准）
+    var lineNumbers = new List<int>();
+    foreach (var r in ranges)
+    {
+        // 找到这个范围内第一个匹配位置
+        int firstMatch = matchPositions.FirstOrDefault(p => p >= r.Start && p <= r.End, r.Start);
+        int lineNum = CountLines(haystack, firstMatch) + 1;
+        lineNumbers.Add(lineNum);
+    }
+
     var snippets = ranges.Select(r => haystack[r.Start..r.End]).ToList();
-    return (snippets, total);
+    return (snippets, total, lineNumbers);
+}
+
+// 计算文本中某个位置之前有多少换行符（即行号，0-based）
+static int CountLines(string text, int position)
+{
+    int lines = 0;
+    for (int i = 0; i < position && i < text.Length; i++)
+        if (text[i] == '\n') lines++;
+    return lines;
 }
 
 // 全文搜索核心逻辑（CLI 与 TUI 共用）：SQL LIKE 匹配标题/正文/摘要
@@ -6428,10 +6881,14 @@ static class AiState
     public static int ExitCode = 0;  // CLI 退出码（脚本/AI 用 exit code 判断成败；0=成功，非零=失败）
 }
 
-// TUI 图片缓存（URL → 字节）
+// TUI 图片缓存（URL → sixel 字节 + 该图占多少终端单元宽）
+//
+// 连宽度一起存的原因:Markdown 视图**每帧绘制**都会对每个可见图片调一次
+// ImageLoader。命中缓存时如果每次都把几百 KB 的 sixel 解成字符串再跑正则去
+// 取宽度,滚动会直接卡死。宽度在首次编码时算一次就够。
 static class TuiImageCache
 {
-    public static readonly Dictionary<string, byte[]> Map = new();
+    public static readonly Dictionary<string, (byte[] Sixel, int WidthCells)> Map = new();
 }
 
 // TUI Markdown 渲染过程状态（链接收集、图片宽度）
@@ -6439,6 +6896,22 @@ static class TuiMdState
 {
     public static List<(string Text, string Url)> Links = new();
     public static int ImageWidth = 80;
+
+    // —— 图片垂直空间预留(TUI 专用)——
+    //
+    // 是否给图片在文档流里预留垂直空间。只有 TUI 的 Markdown 视图需要 ——
+    // BuildArticleMarkdown 同时供 CLI 导出使用,命令行输出里塞零宽空格是垃圾。
+    public static bool ReserveImageSpace = false;
+
+    // 零宽空格(U+200B)。它不是空白字符,所以 CommonMark 不会把它所在的行当成
+    // 空行折叠掉(char.IsWhiteSpace('\u200b') == false),但渲染宽度为 0,
+    // 屏幕上看起来就是空行。用它来"伪造"不会被折叠的连续空行。
+    public const string BlankLineFiller = "\u200b";
+
+    // 图片后面补多少个"零宽空格段落"。实测每个产出 2 行(自身 + 段落间隔),
+    // 所以 10 个 = 20 行。图片最高 18 单元(见 ImageSixel.cs 的 MaxHeightCells),
+    // 预留 20 行 -> 图片底部到正文之间约 2 行空隙;图片偏矮时空隙会更大些。
+    public const int ImageReservedBlankParagraphs = 10;
 }
 
 // ══════════ 语言 / 本地化支持 ══════════
@@ -6650,6 +7123,7 @@ class GrepSnippetResult
     public string FeedTitle { get; set; } = "";
     public int Count { get; set; }
     public List<string> Snippets { get; set; } = new();
+    public List<int> LineNumbers { get; set; } = new();
     public int TotalSnippets { get; set; }
     public string Quality { get; set; } = "";
 }

@@ -60,6 +60,10 @@
     <PackageReference Include="SQLitePCLRaw.core" Version="2.1.13" />
     <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.13" />
     <PackageReference Include="Terminal.Gui" Version="2.4.17" />
+    <!-- 图片解码:Terminal.Gui 自带 sixel 编码器但**不带解码器**,
+         需要先把 RSS 里的 PNG/JPEG/GIF/WebP 解成像素才能编码。
+         锁 3.1.x:Apache-2.0;4.x 起换成 SixLabors 分叉协议,商用有额外限制 -->
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
   </ItemGroup>
 
 </Project>
