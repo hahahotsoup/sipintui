@@ -5,6 +5,7 @@
 // Microsoft.Data.Sqlite 是微软提供的轻量数据库
 using System;
 using System.IO;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
@@ -2836,6 +2837,25 @@ static async Task RunCli(string[] args, string dbPath)
 {
     var cmd = args[0].ToLower();
 
+    // 进 TUI 并**开启文章图片显示**。
+    //
+    // 图片默认关闭,只有这个子命令才开。原因是终端 sixel 能力探测不可靠:
+    // Terminal.Gui 会发查询序列问终端"支持吗",但 sixel 是 DCS 序列,中间必须过
+    // ConPTY(真实的 conhost 实例,不是透传管道),不认识的 DCS 会被吞掉。
+    // WezTerm 自带的 ConPTY 太老时(实测 2024-02-03),探测得到"支持"、实际一张
+    // 图都出不来,画面还会错乱 —— 所以不做自动判断,交给用户显式决定。
+    //
+    // **放在孟思琳检查之前**:pic 等价于无参数启动(`sip`),只是多开一个图片
+    // 开关,不做任何写操作。而挡位 3 的语义是"只允许通过 TUI 使用" —— pic 本身
+    // 就是 TUI 入口,不该被自己的规则挡在门外。
+    if (cmd == "pic")
+    {
+        ImagesEnabled = true;
+        var picExit = await RunTui(dbPath);
+        SetExit(picExit);
+        return;
+    }
+
     // 孟思琳(simon)安全守护:非交互调用按挡位拦截(挡位 1 不拦,行为不变)
     string? simonBlock = SimonCheckBlock(cmd, args);
     if (simonBlock != null)
@@ -2854,6 +2874,7 @@ static async Task RunCli(string[] args, string dbPath)
         SimonCli(args.Skip(1).ToArray(), dbPath);
         return;
     }
+
 
     // 原文阅读：sip --show <文章编号>
     //   默认 → 全屏阅读界面（无侧栏，W 进入完整 TUI，Esc/Q 退出），给人读文章
@@ -3097,6 +3118,7 @@ static void PrintHelp()
     Console.WriteLine(Lang.T("  -a, --archive    archive a feed (add timestamp)"));
     Console.WriteLine(Lang.T("  -una, --unarchive unarchive a feed"));
     Console.WriteLine(Lang.T("  -r, --remove     delete a feed (add --yes to skip confirmation)"));
+    Console.WriteLine(Lang.T("  pic              TUI with article images on (sixel); images are OFF by default — terminal sixel detection is unreliable"));
     Console.WriteLine(Lang.T("  --show <id>      fullscreen reading (no sidebar; W = full TUI, Esc = exit); add --json to output raw content for AI/scripts"));
     Console.WriteLine(Lang.T("  --versions <id>  list all versions of an article (use --show <id> to view one)"));
     Console.WriteLine(Lang.T("  --diff <id> [vA vB]  diff two versions of an article (default: last two); --json for structured output"));
@@ -6888,7 +6910,13 @@ static class AiState
 // 取宽度,滚动会直接卡死。宽度在首次编码时算一次就够。
 static class TuiImageCache
 {
-    public static readonly Dictionary<string, (byte[] Sixel, int WidthCells)> Map = new();
+    // 后台预取线程会写、渲染线程会读 —— 必须线程安全,所以是 Concurrent 的。
+    public static readonly ConcurrentDictionary<string, (byte[] Sixel, int WidthCells)> Map = new();
+
+    // 正在下载/编码中的 URL。避免多个预取任务重复下载同一张图
+    // (切文章很快时,旧文章的预取任务可能还在跑)。
+    // value 无意义,用 byte 占位。
+    public static readonly ConcurrentDictionary<string, byte> InFlight = new();
 }
 
 // TUI Markdown 渲染过程状态（链接收集、图片宽度）

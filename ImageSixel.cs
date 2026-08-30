@@ -12,9 +12,11 @@
 // 单独放一个文件的原因：ImageSharp 和 Terminal.Gui 都有 Color / Image 这些名字，
 // 混在 Tui.cs 里会撞名。
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
 using System.Text;
+using System.Threading.Tasks;
 using Terminal.Gui.Drawing;
 using SixLabors.ImageSharp.Processing;
 
@@ -64,8 +66,11 @@ public partial class Program
     }
 
     /// <summary>
-    /// 下载图片并编码为 sixel。任何一步失败都返回 null —— 调用方会退回成链接文本，
-    /// 不让一张烂图打断整篇阅读。
+    /// Markdown.ImageLoader 的回调。**只查缓存,绝不在这里做网络/解码** ——
+    /// 这个函数跑在渲染线程上,任何阻塞都会让整屏冻住(实测打开带图文章会明显卡)。
+    ///
+    /// 未命中时:让后台去取(见 DownloadAndCache),本帧先返回 null 不画图。
+    /// 图到货后由 SipMarkdown.OnImageReady 通知重绘。
     /// </summary>
     static byte[]? LoadImageAsSixel(string url, string baseUrl)
     {
@@ -86,22 +91,67 @@ public partial class Program
                 return cached.Sixel;
             }
 
+            // 缓存没货:后台去取,本帧先空着。渲染线程一毫秒都不等。
+            PrefetchInBackground(url);
+            return null;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// 提前把图片拉下来。切文章 / 预读时调用,让首次打开带图文章不再卡顿。
+    /// 不阻塞调用方 —— 只是把任务丢给线程池。
+    /// </summary>
+    public static void PrefetchImages(IEnumerable<string> urls, string baseUrl)
+    {
+        if (urls == null) return;
+        foreach (var u in urls)
+        {
+            if (string.IsNullOrWhiteSpace(u)) continue;
+            string url = u;
+            if (!Uri.TryCreate(url, UriKind.Absolute, out _) && !string.IsNullOrWhiteSpace(baseUrl))
+            {
+                try { url = new Uri(new Uri(baseUrl), url).AbsoluteUri; }
+                catch { }
+            }
+            PrefetchInBackground(url);
+        }
+    }
+
+    /// <summary>把单个 URL 丢给后台,已缓存或已在下载中则跳过。</summary>
+    static void PrefetchInBackground(string url)
+    {
+        if (TuiImageCache.Map.ContainsKey(url)) return;
+        if (!TuiImageCache.InFlight.TryAdd(url, 0)) return;   // 已在下载
+        _ = Task.Run(() =>
+        {
+            try { DownloadAndCache(url); }
+            finally { TuiImageCache.InFlight.TryRemove(url, out _); }
+        });
+    }
+
+    /// <summary>后台线程:下载 -> 解码 -> sixel 编码 -> 入缓存 -> 通知重绘。</summary>
+    static void DownloadAndCache(string url)
+    {
+        if (TuiImageCache.Map.ContainsKey(url)) return;
+        try
+        {
             SixelLog($"GET {url}");
             var resp = ImageHttpClient.GetAsync(url).GetAwaiter().GetResult();
             if (!resp.IsSuccessStatusCode)
             {
                 SixelLog($"  HTTP {(int)resp.StatusCode}");
-                return null;
+                return;
             }
 
             var raw = resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
-            if (raw.Length == 0) return null;
+            if (raw.Length == 0) return;
 
             var sixel = EncodeToSixel(raw);
             if (sixel is null || sixel.Length == 0)
             {
                 SixelLog("  encode failed (unsupported/corrupt image)");
-                return null;
+                return;
             }
 
             SixelLog($"  ok {raw.Length}B image -> {sixel.Length}B sixel");
@@ -111,16 +161,24 @@ public partial class Program
             // ParseSixelSizeCells 会按终端每单元像素数换算成单元。
             var sixelText = System.Text.Encoding.UTF8.GetString(sixel);
             var (widthCells, heightCells) = SipMarkdown.ParseSixelSizeCells(sixelText);
-            SipMarkdown.RegisterImage(url, widthCells);
             SixelLog($"  {widthCells}x{heightCells} cells");
 
             TuiImageCache.Map[url] = (sixel, widthCells);
-            return sixel;
+            SipMarkdown.RegisterImage(url, widthCells);
+
+            // 通知 UI 重绘。Application.Invoke 会把动作排到主循环里执行,
+            // 这是在后台线程里碰 UI 的唯一安全方式。
+            try
+            {
+#pragma warning disable CS0618   // legacy 静态入口,本项目整体都还在用
+                Terminal.Gui.App.Application.Invoke(() => SipMarkdown.OnImageReady?.Invoke());
+#pragma warning restore CS0618
+            }
+            catch { /* 应用可能正在退出 */ }
         }
         catch (Exception ex)
         {
             SixelLog($"  exception: {ex.GetType().Name}: {ex.Message}");
-            return null;
         }
     }
 

@@ -176,7 +176,12 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
 
         // TUI 里给图片预留垂直空间。BuildArticleMarkdown 同时供 CLI 导出使用,
         // 那边不能加零宽空格,所以用开关区分而不是写死在生成逻辑里。
-        TuiMdState.ReserveImageSpace = true;
+        //
+        // 图片默认关闭 —— 只有 `sip pic` 启动时才开(ImagesEnabled)。原因见
+        // ImageSixel.cs 头注释:终端 sixel 能力探测不可靠,WezTerm 自带的 ConPTY
+        // 太老会吞掉 sixel,探测说"支持"实际出不来图还会让画面错乱。所以交给
+        // 用户显式决定。
+        TuiMdState.ReserveImageSpace = ImagesEnabled;
 
         // —— 左侧：订阅源 + 文章 侧栏（文章标题自动换行显示）——
         // 侧栏为自绘 View：来源可展开/折叠，标题过长时自动换行（CJK 宽度感知）
@@ -532,6 +537,9 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
                 _lastBaseUrl = GetArticleLink(n.ItemId, dbPath);
                 contentView.Text = BuildArticleMarkdown(n.ItemId, contentMode, dbPath, contentView.GetContentWidth(), showFetchHint: true);
             }
+            // 文章渲染完立刻把图片丢给后台预取。渲染线程不等网络/解码,
+            // 图到货后由 SipMarkdown.OnImageReady 通知重绘。
+            PrefetchArticleImages(contentView.Text, _lastBaseUrl);
             // 检测到历史进度 → 提示（不自动跳，等用户按 Space）；非法值直接忽略
             _savedScrollY = progressMap.TryGetValue(n.ItemId, out int y) && y > 0 ? y : -1;
             UpdateStats();                             // 有进度时状态行显示跳转提示
@@ -543,6 +551,7 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
         {
             contentMode = true;   // 历史版本固定用完整正文
             contentView.Text = BuildArticleMarkdown(itemId, true, dbPath, contentView.GetContentWidth());
+            PrefetchArticleImages(contentView.Text, _lastBaseUrl);
             contentView.Title = " " + Lang.T("Content") + " · v" + version + " ";
             contentView.SetFocus();
         }
@@ -832,6 +841,7 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
                 Lang.T("           lang <code> (switch UI language, e.g. zh-CN / en-US)"),
                 Lang.T("           diff <id> / export <id|feed:N|all> / export-opml / import-opml <file>"),
                 Lang.T("           feed-info <id> / like <id> / likes / purge-fulltext [id]"),
+                Lang.T("           pic (toggle article images; off by default — sixel detection is unreliable)"),
                 Lang.T("           dedup（无参=交互选择） / dedup scan|list|undo / insights-interval <7d|30d|off> / telemetry ... / config"));
             var ok = new Button { Text = Lang.T("OK"), IsDefault = true, X = 0, Y = Pos.Bottom(txt) };
             var about = new Button { Text = Lang.T("About"), X = Pos.Right(ok) + 1, Y = Pos.Bottom(txt) };
@@ -1254,6 +1264,29 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
                 case "h" or "help":
                     ShowHelpDialog();
                     return;
+                case "pic" or "--pic":
+                {
+                    // 开关文章图片显示。**默认关闭** —— 终端 sixel 能力探测不可靠
+                    // (见 ImagesEnabled 的注释):WezTerm 自带的 ConPTY 太老时会
+                    // 吞掉 sixel,探测说"支持"、实际一张图都出不来还会让画面错乱。
+                    // 所以不做自动判断,由用户在确认自己终端 OK 的前提下手动打开。
+                    ImagesEnabled = !ImagesEnabled;
+                    TuiMdState.ReserveImageSpace = ImagesEnabled;
+                    contentView.EnableSixelImages = ImagesEnabled;
+
+                    // 垂直留白是写进 Markdown 文本的(ReserveImageSpace 控制),
+                    // 开关变了必须重新生成,否则开着图时没留空间会压住正文、
+                    // 关了图却留着 20 行空白。
+                    if (_currentArticleId != 0)
+                    {
+                        contentView.Text = BuildArticleMarkdown(
+                            _currentArticleId, contentMode, dbPath,
+                            contentView.GetContentWidth(), showFetchHint: true);
+                        if (ImagesEnabled) PrefetchArticleImages(contentView.Text, _lastBaseUrl);
+                    }
+                    contentView.SetNeedsDraw();
+                    return;
+                }
                 case "manage":
                     ShowFeedManager(dbPath);
                     RebuildTree();
@@ -2356,7 +2389,9 @@ static SipMarkdown CreateMarkdownView()
         // ConPTY 是真实的 conhost 实例而不是透传管道，不认识的 DCS(sixel) 序列会被
         // 直接吞掉。Windows Terminal 自带的 OpenConsole 没问题；WezTerm 需要升级它
         // 自带的那对组件到 1.22+，见 tools/upgrade-wezterm-conpty.ps1。
-        EnableSixelImages = true,
+        // 默认关。只有 `sip pic` 启动才开 —— 探测终端 sixel 能力不可靠,
+        // 见 ImagesEnabled 的注释。
+        EnableSixelImages = ImagesEnabled,
         ImageLoader = MarkdownImageLoader
     };
     // 阅读配色：正文亮白、代码绿色、强调亮黄、链接亮青
@@ -2380,7 +2415,33 @@ static SipMarkdown CreateMarkdownView()
     Markdig.MarkdownExtensions.UseSoftlineBreakAsHardlineBreak(pipeBuilder);
     Markdig.MarkdownExtensions.UseEmphasisExtras(pipeBuilder, Markdig.Extensions.EmphasisExtras.EmphasisExtraOptions.Strikethrough);
     v.MarkdownPipeline = pipeBuilder.Build();
+
+    // 后台图片到货时通知重绘。ImageSixel 在线程池里下载+编码,完成后通过
+    // Application.Invoke 排到主循环 —— 这是后台线程碰 UI 的唯一安全方式。
+    SipMarkdown.OnImageReady = () => v.SetNeedsDraw();
     return v;
+}
+
+// 从生成的 Markdown 文本里抽出图片 URL,供后台预取。
+// sipcore 输出的图片语法固定是 `![\u200B](url)`(alt 恒为 ZWSP,见 sipcore 注释),
+// 但这里按通用 Markdown 图片语法匹配,不依赖 alt 的具体内容。
+static readonly Regex MdImageUrlRegex = new(@"!\[[^\]]*\]\(([^)\s]+)", RegexOptions.Compiled);
+
+/// <summary>
+/// 文章渲染后立刻把里面的图片丢给后台预取,避免首次打开带图文章时渲染线程
+/// 被同步下载+解码卡住。MarkdownImageLoader 只在缓存命中时才返回 sixel,
+/// 所以预取是"图能显示出来"的前提,不只是加速。
+/// </summary>
+static void PrefetchArticleImages(string markdownText, string baseUrl)
+{
+    if (string.IsNullOrEmpty(markdownText)) return;
+    var urls = new List<string>();
+    foreach (Match m in MdImageUrlRegex.Matches(markdownText))
+    {
+        var u = m.Groups[1].Value;
+        if (!string.IsNullOrWhiteSpace(u)) urls.Add(u);
+    }
+    if (urls.Count > 0) Program.PrefetchImages(urls, baseUrl);
 }
 
 // 把一篇文章渲染成 Markdown 字符串（TUI 正文区与 CLI 预览共用）
@@ -2446,6 +2507,17 @@ static IEnumerable<TuiNode> LoadArticleNodes(int feedId, string dbPath, int limi
 static byte[]? MarkdownImageLoader(string url) => LoadImageAsSixel(url, _lastBaseUrl);
 
 static string _lastBaseUrl = "";
+
+// 文章图片是否显示。**默认 false** —— 只有 `sip pic` 启动时才置 true。
+//
+// 为什么不能自动探测:Terminal.Gui 会发查询序列问终端"支持 sixel 吗",但 sixel
+// 是 DCS 序列,中间必须过 ConPTY —— 那是真实的 conhost 实例而不是透传管道,
+// 不认识的 DCS 会被直接吞掉。WezTerm 自带的 ConPTY 可能太老(实测 2024-02-03),
+// 于是探测得到"支持"、实际一张图都出不来,画面还会错乱(图片区黑块 + 滚动时
+// 残留)。Windows Terminal 1.22+ 自带的新 ConPTY 没问题。
+// 所以这里不做自动判断,由用户在确认自己终端 OK 的前提下用 `sip pic` 显式打开。
+// 要让 WezTerm 也能用,先跑 tools/upgrade-conpty-admin.cmd 升级它自带的 ConPTY。
+static bool ImagesEnabled = false;
 
 // HTML 正文转 Markdown（保留标题/粗体/斜体/删除线/分隔线/列表/代码/图片，供 TUI Markdown 渲染）
 

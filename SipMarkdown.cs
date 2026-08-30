@@ -16,17 +16,22 @@
 //   - 缓存"自然位置"+每帧重算 → SixelToRender.Id 形如 "url:X:Y",滚动时 drawRow
 //     变,Id 变,缓存全部失效,第一遍读到的是"上帧已经加过 offset 的 ScreenPosition",
 //     第二遍再 +offset → 累积偏移,图片一路向右飞出视口。
-//   - 用 FillRect 抹 alt 文本行 → base 涂 cell grid、driver 写 sixel 像素是
-//     两条独立路径,翻页/滚动时序错开导致"图片明显落后于界面" + 间歇性残影。
 //
 // 现在的写法:
-//   - alt 文本最小化:由 sipcore 在 TUI 模式下输出 `![\u200B](url)`,base 渲染
-//     出 `[\u200B]` —— "[" + ZWSP + "]",仅 2 列可见。CLI 导出走同函数,alt
-//     保留原值作 fallback。
-//   - 不抹 alt:让 base 画的 ZWSP 区域保留,sixel 直接覆盖到 (mdScreenX + offset)
-//     位置 —— 一次性覆盖,无"先空后图"窗口。
 //   - 完全不缓存位置信息:每帧用 Markdown 视口在屏幕上的 X 偏移(父 View 不动就
 //     稳定) + 居中偏移直接计算,幂等。
+//   - alt 文本最小化:由 sipcore 输出 `![\u200B](url)`,base 渲染成 `[\u200B]`
+//     —— "[" + ZWSP + "]",仅 2 列可见。**这 2 列接受残留,不做任何涂除。**
+//
+// 关于"抹掉"alt —— 试过两次,都撤回了(hotsoup 明确要求不要涂):
+//   - 第一次:FillRect 涂整行(altWidth 最大 32 列)。base 涂 cell grid 与 driver
+//     写 sixel 像素是两条独立路径,中间的"已涂空但 sixel 还没画"窗口有
+//     18 行 × 32 列那么大 → 翻页时"图片明显落后于界面" + 间歇性空隙。
+//   - 第二次:只涂 `[` `]` 两个字符列(窗口窄 16 倍)。hotsoup 仍然要求撤掉。
+//
+// 结论:Markdig image 解析路径下 "[]" 2 列是硬下限(GetFallbackText 私有,空 alt
+// 会兜底成 "[image]" 6 列更糟)。真要归零只能绕开 Markdig image 解析、改用
+// RasterImageCommand 自己提交图片 —— 那是另一套架构,暂不做。
 //
 // 单位换算(实测确认,见 .probe/ 下的探针):
 //   * SixelEncoder.EncodeSixel(Color[W,H]) 输出的头是  ESC P 0;0;0 q "1;1;W;H
@@ -71,6 +76,12 @@ public class SipMarkdown : Markdown
         if (widthCells > 0) _imageWidths[url] = widthCells;
     }
 
+    /// <summary>
+    /// 后台图片到货时调用(由 ImageSixel 通过 Application.Invoke 排到主循环)。
+    /// Tui.cs 负责把它设成触发重绘的动作,例如 () => contentView.SetNeedsDraw()。
+    /// </summary>
+    public static Action? OnImageReady;
+
     /// <summary>切换文章时清空,避免旧 URL 一直占着注册表。</summary>
     public static void ClearImageRegistry() => _imageWidths.Clear();
 
@@ -111,19 +122,6 @@ public class SipMarkdown : Markdown
         var m = SixelSizeRegex.Match(sixelUtf8);
         if (!m.Success) return (0, 0);
         return PixelsToCells(int.Parse(m.Groups[1].Value), int.Parse(m.Groups[2].Value));
-    }
-
-    /// <summary>
-    /// 从 SixelToRender.Id("url:X:Y")里抽出 URL 段(冒号定界,保留端口号里的 ':')。
-    /// 失败时返回 null。
-    /// </summary>
-    static string? ExtractUrlFromId(string id)
-    {
-        int lastColon = id.LastIndexOf(':');
-        if (lastColon < 0) return null;
-        int secondLastColon = id.LastIndexOf(':', lastColon - 1);
-        if (secondLastColon < 0) return null;
-        return id.Substring(0, secondLastColon);
     }
 
     protected override bool OnDrawingSubViews(DrawContext? context)
