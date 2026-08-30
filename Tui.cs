@@ -289,6 +289,8 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
         var progressMap = LoadReadingProgress();
         long _currentArticleId = 0;
         int _savedScrollY = -1;   // 打开文章时若检测到历史进度，存这里；-1 = 无
+        bool _pageFlipMode = false;   // false=滚动模式,true=翻页模式(PDF 强制 true)
+        bool _isPdfArticle = false;   // 当前文章是否为 PDF 导入(强制翻页,不可切换)
 
         // —— Telemetry 阅读状态（仅内存，会话内）——
         double _maxProgress = 0;      // 当前文章最大进度 0-1
@@ -380,7 +382,8 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
                 return;
             }
             var (cur, tot) = tree.ArticlePosition();
-            statsLabel.Text = Lang.T("feeds {0} · article {1}/{2}", _statsFeeds, cur, Math.Max(_statsArticles, tot));
+            string modeHint = _isPdfArticle ? "[PDF]" : (_pageFlipMode ? "[Flip]" : "[Scroll]");
+            statsLabel.Text = Lang.T("feeds {0} · article {1}/{2} · {3}", _statsFeeds, cur, Math.Max(_statsArticles, tot), modeHint);
             top.Title = $" sip RSS Reader · {Lang.T("feeds {0}", _statsFeeds)} ";
         }
 
@@ -530,6 +533,8 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
                 _lastBaseUrl = GetArticleLink(n.ItemId, dbPath);
                 contentView.Text = BuildArticleMarkdown(n.ItemId, contentMode, dbPath, contentView.GetContentWidth(), showFetchHint: true);
                 _currentArticleId = n.ItemId;
+                _isPdfArticle = _lastBaseUrl.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+                if (_isPdfArticle) _pageFlipMode = true;   // PDF 强制翻页
                 TelemetryOpenArticle(n.ItemId, n.FeedId);   // article_open + 计时初始化
             }
             else
@@ -1080,31 +1085,42 @@ static async Task<int> RunTui(string dbPath, bool appReady = false, bool showSta
                     else if (!sidebarCollapsed) tree.SetFocus();
                     e.Handled = true;
                     break;
+                case KeyCode.Tab:
+                    if (!_isPdfArticle)
+                    {
+                        _pageFlipMode = !_pageFlipMode;
+                        UpdateStats();
+                    }
+                    e.Handled = true;
+                    break;
                 case KeyCode.CursorUp:
                 case KeyCode.K:
                     if (_savedScrollY > 0) { _savedScrollY = -1; UpdateStats(); }   // 手动滚动 → 撤掉跳转提示
                     if (linkNavMode) { CycleLink(-1); }
-                    else { TelemetryActivityTick(); PageFlip(contentView, -1); }
+                    else if (_pageFlipMode) { TelemetryActivityTick(); PageFlip(contentView, -1); }
+                    else { TelemetryActivityTick(); contentView.ScrollVertical(-1); SaveCurrentScroll(); }
                     e.Handled = true;
                     break;
                 case KeyCode.CursorDown:
                 case KeyCode.J:
                     if (_savedScrollY > 0) { _savedScrollY = -1; UpdateStats(); }
                     if (linkNavMode) { CycleLink(1); }
-                    else { TelemetryActivityTick(); PageFlip(contentView, +1); }
+                    else if (_pageFlipMode) { TelemetryActivityTick(); PageFlip(contentView, +1); }
+                    else { TelemetryActivityTick(); contentView.ScrollVertical(1); SaveCurrentScroll(); }
                     e.Handled = true;
                     break;
                 case KeyCode.PageUp:
                 case KeyCode.B:
                     if (_savedScrollY > 0) { _savedScrollY = -1; UpdateStats(); }
                     TelemetryActivityTick();
-                    PageFlip(contentView, -1);
+                    if (_pageFlipMode) PageFlip(contentView, -1);
+                    else { contentView.ScrollVertical(-6); SaveCurrentScroll(); }
                     e.Handled = true;
                     break;
                 case KeyCode.PageDown:
                 case KeyCode.Space:
                     if (_savedScrollY > 0) { JumpToSaved(); }   // 有历史进度 → Space 跳回
-                    else { TelemetryActivityTick(); PageFlip(contentView, +1); }
+                    else { TelemetryActivityTick(); if (_pageFlipMode) PageFlip(contentView, +1); else { contentView.ScrollVertical(6); SaveCurrentScroll(); } }
                     e.Handled = true;
                     break;
                 case KeyCode.Enter:

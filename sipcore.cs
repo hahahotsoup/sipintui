@@ -30,8 +30,7 @@ using Terminal.Gui.Views;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Input;
 using Terminal.Gui.Text;
-using UglyToad.PdfPig;
-using UglyToad.PdfPig.Content;
+using PdfiumViewer;
 
 // 统一 UTF-8 输入/输出：避免中文在终端 / AI 调用（PowerShell 默认 GBK 代码页）时乱码，
 // 也保证管道输入的同意短语等中文内容按 UTF-8 解码
@@ -653,71 +652,35 @@ static string ReadTextFile(string path)
     return File.ReadAllText(path);
 }
 
-// 按文件头魔法字节嗅探图片扩展名;返回 null 表示不支持(如 Ccitt/JBIG2 原始流)。
-    static string? ImageExtFromMagic(System.ReadOnlySpan<byte> b)
-    {
-        if (b.Length < 4) return null;
-        if (b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return ".jpg";           // JPEG
-        if (b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) return ".png"; // PNG
-        if (b[0] == 0x47 && b[1] == 0x49 && b[2] == 0x46) return ".gif";           // GIF
-        if (b[0] == 0x42 && b[1] == 0x4D) return ".bmp";                           // BMP
-        if ((b[0] == 0x49 && b[1] == 0x49 && b[2] == 0x2A && b[3] == 0x00) ||
-            (b[0] == 0x4D && b[1] == 0x4D && b[2] == 0x00 && b[3] == 0x2A)) return ".tiff"; // TIFF
-        return null;
-    }
-
-// 简易 PDF 文本提取（基于文本流解析，非完整 PDF 解析器）
-    // PDF 导入:用 PdfPig 抽文本 + 图片(按页序)。图片落 assetDir,<img> 交 HtmlToMarkdown。
-    // 相比原 BT/ET 正则,PdfPig 同时能拿到 XObject 图片流,这才是"三种全做"里 PDF 保图的关键。
+// PDF 导入:用 pdfium(PdfiumViewer)把每一页渲染成 PNG 图片,不再抽文本。
+    // 原因:PDF 里常含表格/复杂排版,文本抽取会丢版式;直接出页面图片最保真。
+    // 每页固定宽度 1200px(~终端 120 列),高度按比例,存 assetDir,<img> 交 HtmlToMarkdown。
     static string ReadPdfFile(string path, string assetDir)
     {
         var sb = new System.Text.StringBuilder();
         try
         {
-            using var doc = PdfDocument.Open(path);
-            foreach (var page in doc.GetPages())
+            using var doc = PdfiumViewer.PdfDocument.Load(path);
+            int pageCount = doc.PageCount;
+            const int targetWidth = 1200;   // 约终端 120 列
+            for (int i = 0; i < pageCount; i++)
             {
-                var text = page.Text;
-                if (!string.IsNullOrWhiteSpace(text))
-                {
-                    sb.Append("<p>");
-                    sb.Append(System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ").Trim());
-                    sb.Append("</p>\n\n");
-                }
-                try
-                {
-                    foreach (var img in page.GetImages())
-                    {
-                        // 优先用 TryGetPng 把任意可解码图片归一化成 PNG(JPEG/Ccitt 等也最稳);
-                        // 失败再退回原始流并按魔法字节嗅探,只收 JPEG/PNG/GIF/BMP/TIFF。
-                        byte[]? data = null;
-                        string? ext;
-                        if (img.TryGetPng(out var png) && png != null && png.Length > 0)
-                        {
-                            data = png; ext = ".png";
-                        }
-                        else
-                        {
-                            var rb = img.RawBytes;          // Span<byte>
-                            if (rb.IsEmpty) continue;
-                            ext = ImageExtFromMagic(rb);    // ReadOnlySpan<byte> 重载
-                            if (ext == null) continue;      // Ccitt/JBIG2 等无魔法字节,跳过
-                            data = rb.ToArray();
-                        }
-                        if (data == null || data.Length == 0) continue;
-                        var name = $"{Guid.NewGuid():N}{ext}";
-                        try
-                        {
-                            File.WriteAllBytes(System.IO.Path.Combine(assetDir, name), data);
-                            sb.Append($"<img src=\"{LocalFileUrl(System.IO.Path.Combine(assetDir, name))}\"/>\n\n");
-                        }
-                        catch { /* 跳过坏图 */ }
-                    }
-                }
-                catch { /* 某页抽图失败不影响整篇 */ }
+                var size = doc.PageSizes[i];
+                float scale = targetWidth / size.Width;
+                int width = targetWidth;
+                int height = Math.Max(1, (int)(size.Height * scale));
+                using var rendered = doc.Render(i, width, height, 150, 150, PdfiumViewer.PdfRenderFlags.CorrectFromDpi);
+                // pdfium 的 Render 在某些版本下会忽略 width/height 而按 DPI 出大图,
+                // 这里再用 Bitmap 构造函数缩到目标尺寸,避免 sixel 编码后过大。
+                int finalH = Math.Max(1, (int)(targetWidth * rendered.Height / (double)rendered.Width));
+                using var image = new System.Drawing.Bitmap(rendered, new System.Drawing.Size(targetWidth, finalH));
+                var name = $"{Guid.NewGuid():N}.png";
+                var fullPath = System.IO.Path.Combine(assetDir, name);
+                image.Save(fullPath, System.Drawing.Imaging.ImageFormat.Png);
+                sb.Append($"<img src=\"{LocalFileUrl(fullPath)}\"/>\n\n");
             }
         }
-        catch { /* PDF 解析失败返回已抽到的内容(可能为空) */ }
+        catch { /* PDF 渲染失败返回已处理页面(可能为空) */ }
         return sb.ToString();
     }
 

@@ -51,7 +51,8 @@
          SQLitePCLRaw 全家统一 2.1.11(10.x 依赖 core 3.x 与 sqlcipher 不兼容)。
          入口 SetProvider(e_sqlcipher)覆盖默认 provider;未加密库行为不变 -->
     <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
-    <PackageReference Include="PdfPig" Version="0.1.16" />
+    <PackageReference Include="PdfiumViewer" Version="2.13.0" />
+    <PackageReference Include="PdfiumViewer.Native.x86_64.v8-xfa" Version="2018.4.8.256" />
     <PackageReference Include="SQLitePCLRaw.provider.e_sqlcipher" Version="2.1.11" />
     <PackageReference Include="SQLitePCLRaw.lib.e_sqlcipher" Version="2.1.11" />
     <!-- bundle 保持 2.1.11(2.1.13 会把 provider.e_sqlite3 拉高,与 SQLCipher provider 2.1.11 上限冲突 NU1605) -->
@@ -60,6 +61,7 @@
          provider/lib.e_sqlcipher 保持 2.1.11(SQLCipher 上限)。2.1.x 线 API 兼容,挡位 3 加密由测试验证 -->
     <PackageReference Include="SQLitePCLRaw.core" Version="2.1.13" />
     <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.13" />
+    <PackageReference Include="System.Drawing.Common" Version="9.0.0" />
     <PackageReference Include="Terminal.Gui" Version="2.4.17" />
     <!-- 图片解码:Terminal.Gui 自带 sixel 编码器但**不带解码器**,
          需要先把 RSS 里的 PNG/JPEG/GIF/WebP 解成像素才能编码。
