@@ -1044,6 +1044,9 @@ static void ImportCli(string[] args, string dbPath)
         string destPath = Path.Combine(importDir, destName);
         File.Copy(filePath, destPath, true);
 
+        // PDF 记录页数（供超大 PDF 选择性导出，agent 不必整本读取）
+        int? pageCount = GetPdfPageCount(destPath);
+
         long feedId = GetOrCreateImportFeed(dbPath);
 
         using var conn = OpenDb(dbPath);
@@ -1052,8 +1055,8 @@ static void ImportCli(string[] args, string dbPath)
 
         var cmd = conn.CreateCommand();
         cmd.CommandText = @"
-            INSERT INTO Items (FeedId, Title, Link, Description, Author, PublishDate, Content, Guid, Status, Version)
-            VALUES (@feedId, @title, @link, @desc, @author, @pubdate, @content, @guid, 'active', 1)
+            INSERT INTO Items (FeedId, Title, Link, Description, Author, PublishDate, Content, Guid, Status, Version, PageCount)
+            VALUES (@feedId, @title, @link, @desc, @author, @pubdate, @content, @guid, 'active', 1, @pageCount)
         ";
         cmd.Parameters.AddWithValue("@feedId", feedId);
         cmd.Parameters.AddWithValue("@title", importedTitle);
@@ -1063,6 +1066,7 @@ static void ImportCli(string[] args, string dbPath)
         cmd.Parameters.AddWithValue("@pubdate", DateTime.Now.ToString("O"));
         cmd.Parameters.AddWithValue("@content", content);
         cmd.Parameters.AddWithValue("@guid", guid);
+        cmd.Parameters.AddWithValue("@pageCount", (object?)pageCount ?? DBNull.Value);
         cmd.ExecuteNonQuery();
 
         cmd.CommandText = "SELECT last_insert_rowid()";
@@ -3089,7 +3093,8 @@ static async Task RunCli(string[] args, string dbPath)
         }
         bool json = args.Contains("--json", StringComparer.OrdinalIgnoreCase);
         bool vision = args.Contains("--vision", StringComparer.OrdinalIgnoreCase);
-        if (json) ShowArticleJson(sNum, dbPath, vision);
+        string? pagesArg = ParsePagesArg(args);
+        if (json) ShowArticleJson(sNum, dbPath, vision, pagesArg);
         else
         {
             if (!ArticleExists(sNum, dbPath)) { SetExit(); Console.WriteLine(Lang.T("Article {0} not found", sNum)); return; }
@@ -3321,7 +3326,7 @@ static void PrintHelp()
     Console.WriteLine(Lang.T("  -una, --unarchive unarchive a feed"));
     Console.WriteLine(Lang.T("  -r, --remove     delete a feed (add --yes to skip confirmation)"));
     Console.WriteLine(Lang.T("  pic              TUI with article images on (sixel); images are OFF by default — terminal sixel detection is unreliable"));
-    Console.WriteLine(Lang.T("  --show <id>      fullscreen reading (no sidebar; W = full TUI, Esc = exit); add --json to output raw content; add --vision to download images to temp dir"));
+    Console.WriteLine(Lang.T("  --show <id>      fullscreen reading (no sidebar; W = full TUI, Esc = exit); add --json to output raw content; add --vision to download images to temp dir; for PDF add --pages <range> (e.g. 3-7) to rasterize only those pages"));
     Console.WriteLine(Lang.T("  --versions <id>  list all versions of an article (use --show <id> to view one)"));
     Console.WriteLine(Lang.T("  --diff <id> [vA vB]  diff two versions of an article (default: last two); --json for structured output"));
     Console.WriteLine(Lang.T("  --export <id | feed:N | all> [out.md|dir]  export article(s) as Markdown (--yes to skip confirm)"));
@@ -4130,6 +4135,7 @@ static void InitDatabase(string dbPath)
             Status      TEXT    DEFAULT 'active',  -- active/archived/deleted
             Version     INTEGER DEFAULT 1,         -- 同一Guid的第几版
             ArchivedAt  TEXT,                      -- 归档时间戳
+            PageCount   INTEGER,                   -- PDF 导入页数(null=非PDF/未记录),供超大 PDF 选择性导出
             FOREIGN KEY (FeedId) REFERENCES Feeds(Id)  -- 需配合 PRAGMA
         );
 
@@ -4219,6 +4225,9 @@ static void InitDatabase(string dbPath)
     try { cmd.CommandText = "ALTER TABLE Feeds ADD COLUMN Schedule TEXT"; cmd.ExecuteNonQuery(); }
     catch (SqliteException) { /* 列已存在则忽略 */ }
     try { cmd.CommandText = "ALTER TABLE Feeds ADD COLUMN LastCheckedAt TEXT"; cmd.ExecuteNonQuery(); }
+    catch (SqliteException) { /* 列已存在则忽略 */ }
+    // 旧库迁移：给 Items 补 PageCount 字段（PDF 导入时记录的页数，供超大 PDF 选择性导出）
+    try { cmd.CommandText = "ALTER TABLE Items ADD COLUMN PageCount INTEGER"; cmd.ExecuteNonQuery(); }
     catch (SqliteException) { /* 列已存在则忽略 */ }
 }
 
@@ -4502,13 +4511,14 @@ static bool ArticleExists(int itemId, string dbPath)
 // ══════════ 原文 JSON 直出（sip --show <文章编号> --json）：供 AI / 脚本读取 ═══════════
 // 不做任何渲染，标题/来源/链接/作者等元信息 + 原始正文（Content 原文，空则 Description）原样输出
 // --vision: 把文章中的图片下载到临时目录,在 JSON 中输出本地路径(供 AI 视觉模型使用)
-static void ShowArticleJson(int itemId, string dbPath, bool vision = false)
+// pagesArg: 仅 PDF 生效,格式 "3" / "3-7" / "1,5,9" / "-10" / "50-",限制只栅格化这些页
+static void ShowArticleJson(int itemId, string dbPath, bool vision = false, string? pagesArg = null)
 {
     using var conn = OpenDb(dbPath);
     conn.Open();
     var cmd = conn.CreateCommand();
     cmd.CommandText = @"
-        SELECT i.Title, i.Content, i.Description, i.Link, i.PublishDate, i.Author, f.Title
+        SELECT i.Title, i.Content, i.Description, i.Link, i.PublishDate, i.Author, f.Title, i.PageCount
         FROM Items i LEFT JOIN Feeds f ON i.FeedId = f.Id
         WHERE i.Id = @id";
     cmd.Parameters.AddWithValue("@id", itemId);
@@ -4522,6 +4532,15 @@ static void ShowArticleJson(int itemId, string dbPath, bool vision = false)
     string pub = r.IsDBNull(4) ? "" : r.GetString(4);
     string author = r.IsDBNull(5) ? "" : r.GetString(5);
     string feed = r.IsDBNull(6) ? "" : r.GetString(6);
+    int? pageCount = r.IsDBNull(7) ? (int?)null : r.GetInt32(7);
+    // 旧库/记录失败时,对存在的 PDF 现场补算页数,保证 agent 能先拿到范围再决定读哪些页
+    if (pageCount == null
+        && !string.IsNullOrWhiteSpace(link)
+        && link.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)
+        && File.Exists(link))
+    {
+        pageCount = GetPdfPageCount(link);
+    }
 
     var sig = GetSignal(itemId);
     string? fulltext = ReadFulltextCache(itemId);
@@ -4531,31 +4550,43 @@ static void ShowArticleJson(int itemId, string dbPath, bool vision = false)
     List<string>? imagePaths = null;
     if (vision)
     {
-        imagePaths = new List<string>();
-        var imgMatches = System.Text.RegularExpressions.Regex.Matches(articleContent, @"<img[^>]*src=""([^""]+)""");
-        string tmpDir = Path.Combine(Path.GetTempPath(), $"sip-vision-{itemId}");
-        Directory.CreateDirectory(tmpDir);
-        int idx = 0;
-        foreach (System.Text.RegularExpressions.Match m in imgMatches)
+        // PDF 导入：整页栅格化（页面即图片），存 readwithhotsoup/temp/<文件名>/page-NNN.png。
+        // 视觉模型按页阅读，保留版式（比抽内嵌图更适合 PDF）。
+        bool isPdf = !string.IsNullOrWhiteSpace(link)
+            && link.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)
+            && File.Exists(link);
+        if (isPdf)
         {
-            string imgUrl = m.Groups[1].Value;
-            var bytes = FetchImageBytes(imgUrl);
-            if (bytes != null)
-            {
-                string ext = ".png";
-                if (bytes.Length > 4)
-                {
-                    if (bytes[0] == 0xFF && bytes[1] == 0xD8) ext = ".jpg";
-                    else if (bytes[0] == 0x89 && bytes[1] == 0x50) ext = ".png";
-                    else if (bytes[0] == 0x47 && bytes[1] == 0x49) ext = ".gif";
-                }
-                string imgPath = Path.Combine(tmpDir, $"img{idx}{ext}");
-                File.WriteAllBytes(imgPath, bytes);
-                imagePaths.Add(imgPath);
-                idx++;
-            }
+            imagePaths = RenderPdfPages(link, pagesArg);
         }
-        if (imagePaths.Count == 0) imagePaths = null;
+        else
+        {
+            imagePaths = new List<string>();
+            var imgMatches = System.Text.RegularExpressions.Regex.Matches(articleContent, @"<img[^>]*src=""([^""]+)""");
+            string tmpDir = Path.Combine(Path.GetTempPath(), $"sip-vision-{itemId}");
+            Directory.CreateDirectory(tmpDir);
+            int idx = 0;
+            foreach (System.Text.RegularExpressions.Match m in imgMatches)
+            {
+                string imgUrl = m.Groups[1].Value;
+                var bytes = FetchImageBytes(imgUrl);
+                if (bytes != null)
+                {
+                    string ext = ".png";
+                    if (bytes.Length > 4)
+                    {
+                        if (bytes[0] == 0xFF && bytes[1] == 0xD8) ext = ".jpg";
+                        else if (bytes[0] == 0x89 && bytes[1] == 0x50) ext = ".png";
+                        else if (bytes[0] == 0x47 && bytes[1] == 0x49) ext = ".gif";
+                    }
+                    string imgPath = Path.Combine(tmpDir, $"img{idx}{ext}");
+                    File.WriteAllBytes(imgPath, bytes);
+                    imagePaths.Add(imgPath);
+                    idx++;
+                }
+            }
+            if (imagePaths.Count == 0) imagePaths = null;
+        }
     }
 
     JsonOut(new
@@ -4574,9 +4605,101 @@ static void ShowArticleJson(int itemId, string dbPath, bool vision = false)
             aiLiked = sig?.AiLike ?? false,
             content = articleContent,
             fulltext = fulltext,
+            pageCount = pageCount,
             images = imagePaths
         }
     });
+}
+
+// 读取 PDF 页数（不栅格化，仅解析结构）。失败返回 null。
+static int? GetPdfPageCount(string pdfPath)
+{
+    try
+    {
+        string b64 = Convert.ToBase64String(File.ReadAllBytes(pdfPath));
+#pragma warning disable CA1416 // PDFtoImage 在我们发布的 Windows/Linux/macOS 平台上均受支持；net10.0 的宽泛 TFM 仅触发静态分析误报
+        int pc = PDFtoImage.Conversion.GetPageCount(b64, null);
+#pragma warning restore CA1416
+        return pc > 0 ? pc : (int?)null;
+    }
+    catch { return null; }
+}
+
+// 将 PDF 的指定页（或全部页）光栅化为 PNG（整页作为图片，便于视觉模型阅读）。
+// 保存到 readwithhotsoup/temp/<文件名>/page-NNN.png，按页码命名。
+// pagesArg: "3" / "3-7" / "1,5,9" / "-10" / "50-"（null 或空=全部页）。
+static List<string> RenderPdfPages(string pdfPath, string? pagesArg = null)
+{
+    var result = new List<string>();
+    try
+    {
+        string b64 = Convert.ToBase64String(File.ReadAllBytes(pdfPath));
+#pragma warning disable CA1416
+        int pageCount = PDFtoImage.Conversion.GetPageCount(b64, null);
+        if (pageCount <= 0) return result;
+        // 解析要渲染的 0-based 索引集合；传入范围则只渲这些页
+        HashSet<int>? idxSet = null;
+        if (!string.IsNullOrWhiteSpace(pagesArg))
+        {
+            idxSet = ParsePageRange(pagesArg, pageCount);
+            if (idxSet.Count == 0) return result; // 范围全越界
+        }
+        string baseName = Path.GetFileNameWithoutExtension(pdfPath);
+        string outDir = Path.Combine(dataDir, "temp", baseName);
+        Directory.CreateDirectory(outDir);
+        var opts = new PDFtoImage.RenderOptions { Dpi = 150, WithAnnotations = true, WithFormFill = true };
+        for (int p = 0; p < pageCount; p++)
+        {
+            if (idxSet != null && !idxSet.Contains(p)) continue;
+            string pngPath = Path.Combine(outDir, $"page-{p + 1:000}.png");
+            if (!File.Exists(pngPath))
+                PDFtoImage.Conversion.SavePng(pngPath, b64, p, null, opts);
+            result.Add(pngPath);
+        }
+#pragma warning restore CA1416
+    }
+    catch (Exception ex)
+    {
+        System.Diagnostics.Debug.WriteLine($"PDF page rasterization failed: {ex.Message}");
+    }
+    return result;
+}
+
+// 解析 --pages 范围串（1-based 页码）："3" / "3-7" / "1,5,9" / "-10" / "50-"（开区间靠 pageCount 闭合）
+static HashSet<int> ParsePageRange(string spec, int pageCount)
+{
+    var set = new HashSet<int>();
+    foreach (var raw in spec.Split(',', StringSplitOptions.RemoveEmptyEntries))
+    {
+        var t = raw.Trim();
+        if (t.Length == 0) continue;
+        if (t.Contains('-'))
+        {
+            var segs = t.Split('-', 2);
+            int lo = segs[0].Length == 0 ? 1 : (int.TryParse(segs[0], out var a) ? a : 1);
+            int hi = segs[1].Length == 0 ? pageCount : (int.TryParse(segs[1], out var b) ? b : pageCount);
+            for (int n = lo; n <= hi; n++) if (n >= 1 && n <= pageCount) set.Add(n - 1);
+        }
+        else if (int.TryParse(t, out int n))
+        {
+            if (n >= 1 && n <= pageCount) set.Add(n - 1);
+        }
+    }
+    return set;
+}
+
+// 从参数里取 --pages 的值，支持 "--pages 3-7" 与 "--pages=3-7" 两种写法
+static string? ParsePagesArg(string[] args)
+{
+    for (int i = 0; i < args.Length; i++)
+    {
+        var a = args[i];
+        if (a.Equals("--pages", StringComparison.OrdinalIgnoreCase))
+            return i + 1 < args.Length ? args[i + 1] : null;
+        if (a.StartsWith("--pages=", StringComparison.OrdinalIgnoreCase))
+            return a.Substring("--pages=".Length);
+    }
+    return null;
 }
 
 // 查看文章版本历史 CLI：--versions <文章Id> [--json]

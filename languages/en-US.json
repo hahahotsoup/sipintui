@@ -50,7 +50,7 @@
   "  sip -u 1": "  sip -u 1",
   "  --schedule <id> <expr>  set a feed's update schedule, e.g. 30m / 1h / 7d / daily@10:00 / weekly@Mon 08:00 / manual": "  --schedule <id> <expr>  set a feed's update schedule, e.g. 30m / 1h / 7d / daily@10:00 / weekly@Mon 08:00 / manual",
   "  --search <query> [--feed number] [--threshold 0.7] [--json] semantic search (all feeds without --feed)": "  --search <query> [--feed number] [--threshold 0.7] [--json] semantic search (all feeds without --feed)",
-  "  --show <id>      fullscreen reading (no sidebar; W = full TUI, Esc = exit); add --json to output raw content for AI/scripts": "  --show <id>      fullscreen reading (no sidebar; W = full TUI, Esc = exit); add --json to output raw content for AI/scripts",
+  "  --show <id>      fullscreen reading (no sidebar; W = full TUI, Esc = exit); add --json to output raw content; add --vision to download images to temp dir; for PDF add --pages <range> (e.g. 3-7) to rasterize only those pages": "  --show <id>      fullscreen reading (no sidebar; W = full TUI, Esc = exit); add --json to output raw content; add --vision to download images to temp dir; for PDF add --pages <range> (e.g. 3-7) to rasterize only those pages",
   "  --summary <id>   summarize one article; use feed:<number> for all articles of a feed (--json)": "  --summary <id>   summarize one article; use feed:<number> for all articles of a feed (--json)",
   "  --summary-all    summarize all articles without a summary": "  --summary-all    summarize all articles without a summary",
   "  --sync [--feed N] [--json]  update only 'due' feeds (lists last/next times)": "  --sync [--feed N] [--json]  update only 'due' feeds (lists last/next times)",

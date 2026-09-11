@@ -4,9 +4,9 @@
 
 > ——"Savor it, sip it slow."
 
-> ⏸️ **Due to recent DeepSeek price increases and other factors, development activity will slow down considerably.**
-
 > 📖 This development phase is wrapping up for now. If you'd like to know how this software came to be, read: [《读不进去书的人，做了一个读书的软件》](https://blog.hotsouprealm.top/读不进去书的人，做了一个读书的软件/)
+
+> 🧭 **Roadmap: TUI will be phased out.** The terminal UI still works for now, but new work and long-term maintenance focus on **CLI + Web**. Bare `sip` will not grow more interactive features; prefer the command line and [sip-web](https://github.com/hahahotsoup/sip-webapiextra). TUI may remain through a few stable releases and then be removed — watch Release Notes for the cutoff.
 
 Welcome~
 

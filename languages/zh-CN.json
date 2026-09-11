@@ -51,7 +51,7 @@
   "  sip -u 1": "  sip -u 1",
   "  --schedule <id> <expr>  set a feed's update schedule, e.g. 30m / 1h / 7d / daily@10:00 / weekly@Mon 08:00 / manual": "  --schedule <编号> <表达式> 设置某源更新计划，如 30m / 1h / 7d / daily@10:00 / weekly@Mon 08:00 / manual",
   "  --search <query> [--feed number] [--threshold 0.7] [--json] semantic search (all feeds without --feed)": "  --search <查询>   [--feed 编号] [--threshold 0.7] [--json] 语义搜索（不带 --feed 时搜索全部源）",
-  "  --show <id>      fullscreen reading (no sidebar; W = full TUI, Esc = exit); add --json to output raw content for AI/scripts": "  --show <编号>     全屏阅读（无侧栏；W 进完整 TUI，Esc 退出）；加 --json 输出原文给 AI/脚本",
+  "  --show <id>      fullscreen reading (no sidebar; W = full TUI, Esc = exit); add --json to output raw content; add --vision to download images to temp dir; for PDF add --pages <range> (e.g. 3-7) to rasterize only those pages": "  --show <编号>     全屏阅读（无侧栏；W 进完整 TUI，Esc 退出）；加 --json 输出原文；加 --vision 把图片下到临时目录；PDF 可加 --pages <范围>（如 3-7）只栅格化这些页",
   "  --summary <id>   summarize one article; use feed:<number> for all articles of a feed (--json)": "  --summary <编号>  为文章生成摘要（保存到数据库）；可传 feed:<编号> 为该源全部文章生成（--json）",
   "  --summary-all    summarize all articles without a summary": "  --summary-all    为所有未生成摘要的文章生成摘要",
   "  --sync [--feed N] [--json]  update only 'due' feeds (lists last/next times)": "  --sync [--feed 编号] [--json] 只更新「到期」的订阅源（列表含上次/下次时间）",
